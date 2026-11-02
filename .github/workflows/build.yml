@@ -1,0 +1,142 @@
+name: Build Sonora Android APK
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sonora-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check for uploaded Sonora source archive
+        id: source
+        shell: bash
+        run: |
+          if [ -f sonora-source.zip ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No sonora-source.zip found; upload the source archive to the repository root to start the build."
+          fi
+
+      - name: Unpack source and commit project files
+        if: steps.source.outputs.present == 'true'
+        shell: bash
+        run: |
+          unzip -oq sonora-source.zip -d .
+          rm sonora-source.zip
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Unpack Sonora project source"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Set up Node.js
+        if: steps.source.outputs.present == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Java
+        if: steps.source.outputs.present == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Android SDK
+        if: steps.source.outputs.present == 'true'
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install Android SDK platform and build tools
+        if: steps.source.outputs.present == 'true'
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-36" "build-tools;35.0.0" "build-tools;36.0.0"
+
+      - name: Install dependencies
+        if: steps.source.outputs.present == 'true'
+        run: npm ci
+
+      - name: Build web app
+        if: steps.source.outputs.present == 'true'
+        run: npm run build
+
+      - name: TypeScript check
+        if: steps.source.outputs.present == 'true'
+        run: npm run lint
+
+      - name: Lyrics parser tests
+        if: steps.source.outputs.present == 'true'
+        run: npm run test:lyrics
+
+      - name: Core regression tests
+        if: steps.source.outputs.present == 'true'
+        run: npm run test:core
+
+      - name: Native helper tests
+        if: steps.source.outputs.present == 'true'
+        run: npm run test:native
+
+      - name: Generate Android project
+        if: steps.source.outputs.present == 'true'
+        run: npx cap add android
+
+      - name: Install Sonora native Android layer
+        if: steps.source.outputs.present == 'true'
+        run: bash install-android-native.sh
+
+      - name: Sync Capacitor Android project
+        if: steps.source.outputs.present == 'true'
+        run: npx cap sync android
+
+      - name: Install Sonora launcher icon
+        if: steps.source.outputs.present == 'true'
+        run: bash set-android-icon.sh
+
+      - name: Build debug APK
+        if: steps.source.outputs.present == 'true'
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Rename APK
+        if: steps.source.outputs.present == 'true'
+        run: |
+          mkdir -p out
+          VERSION=$(node -p "require('./package.json').version")
+          cp android/app/build/outputs/apk/debug/app-debug.apk "out/Sonora-v${VERSION}-debug.apk"
+
+      - name: Upload APK artifact
+        if: steps.source.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonora-debug-apk
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attach APK to GitHub release
+        if: steps.source.outputs.present == 'true' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.apk
