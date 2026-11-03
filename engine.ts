@@ -346,8 +346,21 @@ class Engine {
       el.addEventListener("play", () => i === this.active && this.onPlayState(true));
       el.addEventListener("pause", () => i === this.active && !this.crossfading && !el.ended && this.onPlayState(false));
       el.addEventListener("error", () => {
-        if (i === this.active && el.src) toast("Cannot decode this audio file — skipping");
-        if (i === this.active && el.src) setTimeout(() => this.next(), 400);
+        if (i !== this.active || !el.src) return;
+        const mediaError = el.error;
+        diag("media-error", {
+          code: mediaError?.code ?? 0,
+          message: mediaError?.message ?? "",
+          networkState: el.networkState,
+          readyState: el.readyState,
+          source: el.currentSrc || el.src,
+        });
+        toast(mediaError?.code === 4
+          ? "This audio format or file location isn't supported — skipping"
+          : "Could not read this audio file — skipping");
+        setTimeout(() => {
+          if (i === this.active && el.error) this.next();
+        }, 400);
       });
     });
     this.applyElementSettings(settings.get());
@@ -879,7 +892,21 @@ class Engine {
     try {
       await ctx.resume();
       await this.el.play();
-    } catch {}
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      if (failure.name !== "AbortError") {
+        diag("play-rejected", {
+          name: failure.name,
+          message: failure.message,
+          source: this.el.currentSrc || this.el.src,
+          networkState: this.el.networkState,
+          readyState: this.el.readyState,
+        });
+        toast("Couldn't start this track — check its format or file access");
+      }
+      this.el.pause();
+      if (player.get().playing) this.onPlayState(false);
+    }
   }
 
   private checkSleepTrackEnd(): boolean {
@@ -1129,7 +1156,20 @@ class Engine {
         g.value = 1;
       }
     }
-    this.el.play().catch(() => {});
+    this.el.play().catch((error: unknown) => {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      if (failure.name === "AbortError") return;
+      diag("play-rejected", {
+        name: failure.name,
+        message: failure.message,
+        source: this.el.currentSrc || this.el.src,
+        networkState: this.el.networkState,
+        readyState: this.el.readyState,
+      });
+      toast("Couldn't resume this track — check its file access or format");
+      this.el.pause();
+      if (player.get().playing) this.onPlayState(false);
+    });
   }
 
   pause(immediate = false) {

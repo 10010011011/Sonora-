@@ -3,6 +3,7 @@ package app.sonora.player;
 import android.content.ContentResolver;
 import android.content.res.AssetFileDescriptor;
 import android.net.Uri;
+import android.os.ParcelFileDescriptor;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 
@@ -135,19 +136,33 @@ final class MediaRequestHandler {
             @Override public InputStream open(long start, long length) throws IOException {
                 AssetFileDescriptor afd = resolver.openAssetFileDescriptor(uri, "r");
                 if (afd == null) throw new IOException("Could not open file");
-                FileInputStream in = afd.createInputStream(); // closing it closes the descriptor
+                // Use the raw descriptor stream, not afd.createInputStream(). On Android versions
+                // where AssetFileDescriptor.AutoCloseInputStream applies startOffset itself, seeking
+                // the wrapper can behave differently across providers/API levels. We apply the offset
+                // exactly once here, for both seekable files and pipe-backed document providers.
+                FileInputStream in = new ParcelFileDescriptor.AutoCloseInputStream(afd.getParcelFileDescriptor());
                 try {
-                    long skip = afd.getStartOffset() + start;
-                    if (skip > 0) {
+                    long absoluteStart = afd.getStartOffset() + start;
+                    if (absoluteStart > 0) {
                         try {
-                            in.getChannel().position(skip);
-                        } catch (IOException notSeekable) {
-                            long left = skip;
-                            while (left > 0) { long s = in.skip(left); if (s <= 0) throw notSeekable; left -= s; }
+                            in.getChannel().position(absoluteStart);
+                        } catch (IOException | UnsupportedOperationException notSeekable) {
+                            long left = absoluteStart;
+                            while (left > 0) {
+                                long skipped = in.skip(left);
+                                if (skipped > 0) {
+                                    left -= skipped;
+                                } else {
+                                    // Some provider pipes report zero from skip() while data is still
+                                    // available. Consume one byte to guarantee forward progress.
+                                    if (in.read() < 0) throw new IOException("Could not seek within document stream", notSeekable);
+                                    left--;
+                                }
+                            }
                         }
                     }
-                } catch (IOException e) {
-                    in.close();
+                } catch (IOException | RuntimeException e) {
+                    try { in.close(); } catch (IOException ignored) { }
                     throw e;
                 }
                 return new BoundedInputStream(in, length);
