@@ -540,7 +540,9 @@ final class LibraryImporter {
         rec.put("key", key);
         rec.put("fileName", name);
         String ext = SonoraUtil.extOf(name);
-        String mime = e.mime != null && e.mime.startsWith("audio/") ? e.mime : SonoraUtil.mimeForExt(ext);
+        // Prefer the canonical media type implied by a known audio extension. Storage providers
+        // sometimes report aliases such as audio/x-flac, which Chromium WebView may not recognise.
+        String mime = SonoraUtil.playbackMime(e.mime, ext);
         rec.put("mime", mime);
         rec.put("size", size);
         rec.put("lastModified", e.lastModified);

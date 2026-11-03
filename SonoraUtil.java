@@ -86,6 +86,17 @@ final class SonoraUtil {
         }
     }
 
+    /**
+     * Normalises provider-supplied MIME aliases to the canonical type Chromium expects.
+     * Unknown extensions retain the provider's audio MIME when available.
+     */
+    static String playbackMime(String providerMime, String ext) {
+        String fromExtension = mimeForExt(ext);
+        if (fromExtension.startsWith("audio/")) return fromExtension;
+        return providerMime != null && providerMime.startsWith("audio/")
+            ? providerMime : fromExtension;
+    }
+
     /** @return {artist, title}; artist may be empty. Mirrors titleFromName() in tags.ts. */
     static String[] titleFromName(String name) {
         String base = (name == null ? "" : name).replaceFirst("\\.[^.]+$", "").replace('_', ' ');

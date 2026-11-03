@@ -32,6 +32,10 @@ public class SonoraUtilTest {
         eq("flac", SonoraUtil.extOf("A.FLAC"), "ext"); eq("bin", SonoraUtil.extOf("noext"), "no ext");
         eq("true", SonoraUtil.isAudioName("x.OPUS"), "audio"); eq("false", SonoraUtil.isAudioName("x.jpg"), "not audio");
         eq("true", SonoraUtil.isLyricName("x.lrc"), "lyric");
+        eq("audio/flac", SonoraUtil.playbackMime("audio/x-flac", "flac"), "normalise provider FLAC MIME");
+        eq("audio/ogg", SonoraUtil.playbackMime("audio/opus", "opus"), "normalise Opus container MIME");
+        eq("audio/mpeg", SonoraUtil.playbackMime("audio/x-mp3", "mp3"), "normalise MP3 MIME");
+        eq("audio/acme", SonoraUtil.playbackMime("audio/acme", "unknown"), "preserve provider MIME for unknown extension");
         eq("a.mp3|12|34", SonoraUtil.idFor("a.mp3", 12, 34), "id");
         eq("a9993e364706816aba3e", SonoraUtil.sha1Hex("abc", 20), "sha1");
         eq("true", SonoraUtil.naturalCompare("Track 2", "Track 10") < 0, "natural");
