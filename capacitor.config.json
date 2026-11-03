@@ -1,0 +1,14 @@
+{
+  "appId": "app.sonora.player",
+  "appName": "Sonora",
+  "webDir": "dist",
+  "android": {
+    "backgroundColor": "#111415",
+    "allowMixedContent": false,
+    "captureInput": true,
+    "useLegacyBridge": true
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}
