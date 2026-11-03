@@ -341,10 +341,11 @@ public class SonoraPlayerPlugin extends Plugin {
 
     /* ------------------------------------------------------------------ "Open with Sonora" */
 
-    /** Switches the launcher icon by enabling one Icon* activity-alias from the manifest (placeholder art for now). */
+    /** Switches the launcher icon by enabling the matching Icon* activity-alias. */
     @PluginMethod
     public void setAppIcon(PluginCall call) {
-        final String[] ids = {"default", "vinyl", "miku", "teto", "neru"};
+        // "vinyl" remains recognised for upgrades from the previous placeholder-icon build.
+        final String[] ids = {"default", "general", "miku", "teto", "neru", "vinyl"};
         final String name = call.getString("name", "default");
         String want = "default";
         for (String id : ids) if (id.equals(name)) want = id;

@@ -68,10 +68,6 @@ function useThemeExtras() {
   useEffect(() => {
     if (!isNative()) return;
     const want = themeIcon ? (THEME_ICON[theme] ?? "default") : "default";
-    if (lastIcon.current === null && want === "default") {
-      lastIcon.current = want; // fresh start with the default icon: nothing to change
-      return;
-    }
     if (lastIcon.current === want) return;
     lastIcon.current = want;
     void applyAppIcon(want);

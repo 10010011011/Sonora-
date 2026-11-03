@@ -127,7 +127,15 @@ export const SonoraPlayer = registerPlugin<SonoraPlayerPlugin>("SonoraPlayer");
 export const isNative = () => Capacitor.isNativePlatform();
 
 /** Launcher icon id per theme (matches the Icon* activity-aliases in the manifest). Other themes use the default icon. */
-export const THEME_ICON: Record<string, string> = { vinyl: "vinyl", miku: "miku", teto: "teto", neru: "neru" };
+export const THEME_ICON: Record<string, string> = {
+  dark: "general",
+  light: "general",
+  system: "general",
+  vinyl: "general",
+  miku: "miku",
+  teto: "teto",
+  neru: "neru",
+};
 
 export async function applyAppIcon(name: string): Promise<void> {
   if (!Capacitor.isNativePlatform()) return;

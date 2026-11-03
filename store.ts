@@ -139,7 +139,7 @@ export type WidgetId = (typeof WIDGET_IDS)[number];
 
 export interface Settings {
   theme: ThemeName;
-  /** Launcher icon follows the theme (Android only; placeholder icons for now). */
+  /** When enabled, the Android launcher icon follows the selected theme. */
   themeIcon: boolean;
   volume: number;
   muted: boolean;

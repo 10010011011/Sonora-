@@ -149,8 +149,8 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
             {Capacitor.isNativePlatform() && (
               <div className="setting-line">
                 <div>
-                  <b>Match app icon to theme</b>
-                  <span>Swaps the launcher icon with the theme (placeholder icons for now). Your launcher may take a moment to update.</span>
+                  <b>Sync launcher icon with theme</b>
+                  <span>When on, the launcher icon follows the selected theme. Turn it off to restore Sonora's default waveform icon. Your launcher may take a moment to update.</span>
                 </div>
                 <button
                   type="button"
