@@ -42,14 +42,29 @@ for variant in "" "_round"; do
 XML
 done
 
-# Install the four supplied character/general designs as full-bleed launcher images.
+# Install custom artwork as adaptive icons on Android 8+.
+# Legacy opaque bitmap icons are auto-normalized by many launchers and can look
+# noticeably smaller than adaptive icons. The adaptive wrapper lets the
+# launcher apply its own shape mask without shrinking the whole bitmap first.
+# Keep the original mipmap name as the pre-26 bitmap fallback; store a second
+# bitmap name for the adaptive foreground to avoid a resource-name collision.
 for id in general miku teto neru; do
   source_file="$ASSETS/$id.webp"
   if [ ! -s "$source_file" ]; then
     echo "Missing launcher artwork: $source_file" >&2
     exit 1
   fi
+
   cp "$source_file" "$RES/mipmap-nodpi/ic_launcher_$id.webp"
+  cp "$source_file" "$RES/mipmap-nodpi/ic_launcher_${id}_image.webp"
+
+  cat > "$RES/mipmap-anydpi-v26/ic_launcher_${id}.xml" <<XML
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/sonora_icon_background" />
+    <foreground android:drawable="@mipmap/ic_launcher_${id}_image" />
+</adaptive-icon>
+XML
 done
 
-echo "Installed default, General, Miku, Teto and Neru launcher icons."
+echo "Installed default and adaptive General, Miku, Teto and Neru launcher icons."
