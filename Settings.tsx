@@ -419,14 +419,18 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
               </button>
             </div>
 
-            {!named && (
+            {(!named || Capacitor.isNativePlatform()) && (
               <div className="setting-line">
                 <div>
                   <b>Headset device names</b>
-                  <span>Unlock Bluetooth / USB headset names for automatic EQ profile switching</span>
+                  <span>
+                    {Capacitor.isNativePlatform()
+                      ? "Reads connected Bluetooth / USB output names directly from Android. No microphone permission is needed."
+                      : "Unlock Bluetooth / USB headset names for automatic EQ profile switching"}
+                  </span>
                 </div>
                 <button type="button" className="outline-button h-8 px-3 text-xs" onClick={requestDeviceNames}>
-                  Unlock names
+                  {Capacitor.isNativePlatform() ? "Refresh" : "Unlock names"}
                 </button>
               </div>
             )}
