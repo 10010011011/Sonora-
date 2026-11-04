@@ -198,7 +198,7 @@ export interface Settings {
   librarySort: SortKey;
 }
 
-export type SortKey = "title" | "artist" | "album" | "recent" | "played" | "duration";
+export type SortKey = "title" | "artist" | "album" | "recent" | "played" | "duration" | "manual";
 
 export const defaultSettings: Settings = {
   theme: "dark",
