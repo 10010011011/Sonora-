@@ -67,6 +67,12 @@ export interface FolderInfo {
   accessible: boolean;
 }
 
+export interface AudioOutputDevice {
+  id: string;
+  label: string;
+  key: string;
+}
+
 export interface SessionUpdate {
   playing: boolean;
   title: string;
@@ -111,6 +117,7 @@ interface SonoraPlayerPlugin {
   saveState(o: { json: string }): Promise<void>;
   loadState(): Promise<{ json: string | null }>;
   updateSession(o: SessionUpdate): Promise<void>;
+  getAudioOutputs(): Promise<{ outs: AudioOutputDevice[]; supported: boolean }>;
   requestFocus(): Promise<{ granted: boolean }>;
   requestNotificationPermission(): Promise<{ granted: boolean }>;
   setBackHandled(o: { enabled: boolean }): Promise<void>;
@@ -118,7 +125,7 @@ interface SonoraPlayerPlugin {
   setAppIcon(o: { name: string }): Promise<void>;
   addListener(event: "mediaCommand", cb: (e: MediaCommand) => void): Promise<PluginListenerHandle>;
   addListener(event: "audioFocus", cb: (e: FocusEvent) => void): Promise<PluginListenerHandle>;
-  addListener(event: "becomingNoisy" | "backButton" | "openIntent", cb: () => void): Promise<PluginListenerHandle>;
+  addListener(event: "becomingNoisy" | "backButton" | "openIntent" | "audioDevicesChanged", cb: () => void): Promise<PluginListenerHandle>;
   addListener(event: "importProgress", cb: (e: { done: number; total: number; name: string }) => void): Promise<PluginListenerHandle>;
   addListener(event: "serviceError", cb: (e: { message: string }) => void): Promise<PluginListenerHandle>;
 }
