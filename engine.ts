@@ -1207,7 +1207,7 @@ class Engine {
     const o = 1 - this.active;
     if (this.slotPos[o] == null) return;
     if (s.crossfade > 0 && rem <= s.crossfade && rem > 0.2) this.startOther(rem);
-    else if ((s.gapless || s.crossfade === 0) && rem < 0.15 && this.gapT == null) {
+    else if (s.gapless && s.crossfade === 0 && rem < 0.15 && this.gapT == null) {
       this.gapT = window.setTimeout(() => {
         this.gapT = undefined;
         if (!this.startOther(0)) {
