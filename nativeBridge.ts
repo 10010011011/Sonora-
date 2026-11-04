@@ -9,6 +9,7 @@ import {
 } from "./nativeLibrary";
 import { handleBack, setBackSync } from "./back";
 import { diag } from "./diag";
+import { handleBecomingNoisy } from "./devices";
 
 let started = false;
 const NOTIF_ASKED = "sonora.notifAsked";
@@ -107,10 +108,8 @@ export function initNativeBridge() {
   /* ---------------- Headphones / Bluetooth unplug ---------------- */
   void SonoraPlayer.addListener("becomingNoisy", () => {
     diag("becoming-noisy");
-    if (!settings.get().pauseOnDisconnect || !player.get().playing) return;
     resumeOnGain = false;
-    engine.pause();
-    toast("Audio output disconnected — paused");
+    handleBecomingNoisy();
   });
 
   /* ---------------- Notification / lock screen / headset buttons ---------------- */
