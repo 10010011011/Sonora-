@@ -45,7 +45,7 @@ test("M3U playlist export and import round-trip matches library tracks", () => {
 
 test("resume: last track restores always, long tracks remember, finished tracks reset", () => {
   settings.set({ resumeMinSec: 600 });
-  userdata.set({ version: 1, playlists: [], bookmarks: [], resume: { last: null, byTrack: {} }, trackConfigs: {} });
+  userdata.set({ version: 1, playlists: [], bookmarks: [], resume: { last: null, byTrack: {} }, trackConfigs: {}, libraryOrder: [] });
   saveResume("short", 42, 200);
   assert.equal(startPositionFor(t("short"), "prime"), 42);
   assert.equal(startPositionFor(t("short"), "play"), 0); // short tracks restart when picked
