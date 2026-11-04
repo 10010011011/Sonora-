@@ -51,7 +51,9 @@ public class PlaybackService extends Service {
 
     static final String CHANNEL_ID = "sonora_playback";
     static final int NOTIFICATION_ID = 4201;
-    static final String ACTION_PLAY_PAUSE = "app.sonora.player.PLAY_PAUSE";
+    static final String ACTION_PLAY_PAUSE = "app.sonora.player.PLAY_PAUSE"; // legacy toggle action
+    static final String ACTION_PLAY = "app.sonora.player.PLAY";
+    static final String ACTION_PAUSE = "app.sonora.player.PAUSE";
     static final String ACTION_NEXT = "app.sonora.player.NEXT";
     static final String ACTION_PREV = "app.sonora.player.PREV";
     static final String ACTION_STOP = "app.sonora.player.STOP";
@@ -113,11 +115,16 @@ public class PlaybackService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? null : intent.getAction();
-        if (ACTION_PLAY_PAUSE.equals(action)) command(latest.playing ? "pause" : "play", -1);
-        else if (ACTION_NEXT.equals(action)) command("next", -1);
-        else if (ACTION_PREV.equals(action)) command("previous", -1);
-        else if (ACTION_STOP.equals(action)) { command("stop", -1); stopAndRemove(); return START_NOT_STICKY; }
-        refresh();
+        if (ACTION_PLAY_PAUSE.equals(action)) {
+            command(latest.playing ? "pause" : "play", -1);
+            return START_NOT_STICKY;
+        }
+        if (ACTION_PLAY.equals(action)) { command("play", -1); return START_NOT_STICKY; }
+        if (ACTION_PAUSE.equals(action)) { command("pause", -1); return START_NOT_STICKY; }
+        if (ACTION_NEXT.equals(action)) { command("next", -1); return START_NOT_STICKY; }
+        if (ACTION_PREV.equals(action)) { command("previous", -1); return START_NOT_STICKY; }
+        if (ACTION_STOP.equals(action)) { command("stop", -1); stopAndRemove(); return START_NOT_STICKY; }
+        refresh(); // A plain start must satisfy startForegroundService's foreground deadline.
         return START_NOT_STICKY; // JS state is gone if we are killed, so never restart blindly
     }
 
@@ -219,7 +226,7 @@ public class PlaybackService extends Service {
             .setOngoing(s.playing)
             .addAction(R.drawable.ic_sonora_prev, "Previous", servicePending(ACTION_PREV, 1))
             .addAction(s.playing ? R.drawable.ic_sonora_pause : R.drawable.ic_sonora_play,
-                s.playing ? "Pause" : "Play", servicePending(ACTION_PLAY_PAUSE, 2))
+                s.playing ? "Pause" : "Play", servicePending(s.playing ? ACTION_PAUSE : ACTION_PLAY, 2))
             .addAction(R.drawable.ic_sonora_next, "Next", servicePending(ACTION_NEXT, 3))
             .setStyle(new androidx.media.app.NotificationCompat.MediaStyle()
                 .setMediaSession(session.getSessionToken())
