@@ -62,9 +62,9 @@ public class MainActivity extends BridgeActivity {
     @Override public void onPause() { super.onPause(); keepWebViewRunningWhilePlaying(); }
     @Override public void onStop() { super.onStop(); keepWebViewRunningWhilePlaying(); }
 
-    /** The WebView produces the audio, so it (and its timers) must not be paused while music plays. */
+    /** The WebView owns transport state; keep it responsive while the MediaSession notification is active. */
     private void keepWebViewRunningWhilePlaying() {
-        if (!PlaybackService.isPlaying() || getBridge() == null) return;
+        if (!PlaybackService.isSessionActive() || getBridge() == null) return;
         WebView webView = getBridge().getWebView();
         if (webView == null) return;
         webView.onResume();
