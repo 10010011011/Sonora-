@@ -63,6 +63,8 @@ public class PlaybackService extends Service {
     private static volatile Snapshot latest = new Snapshot();
 
     static boolean isPlaying() { return latest.playing; }
+    /** The paused MediaSession still needs the WebView alive to receive notification play/skip commands. */
+    static boolean isSessionActive() { return instance != null; }
 
     /** Entry point used by the plugin. Starts the service only when playback actually begins. */
     static void apply(Context context, Snapshot snapshot) {
