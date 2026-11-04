@@ -1,5 +1,6 @@
 import { settings, player, toast, createStore, type SoundProfile } from "./store";
 import { engine } from "./engine";
+import { isNative, SonoraPlayer } from "./nativeLibrary";
 
 export interface OutDev {
   id: string;
@@ -18,76 +19,105 @@ let pausedByDisconnect = false;
 let prevKeys = new Set<string>();
 
 const keyFor = (d: MediaDeviceInfo) =>
-  (d.label ? d.label.replace(/\s*\(.*?\)\s*$/, "").trim() : d.deviceId.slice(0, 12)) || "default";
+  (d.label ? d.label.replace(/\\s*\\(.*?\\)\\s*$/, "").trim() : d.deviceId.slice(0, 12)) || "default";
+
+function publishScan(outs: OutDev[], initial: boolean, supported = true) {
+  const named = outs.some((o) => o.label && o.label !== "Audio output device" && o.label !== "System default output");
+  devices.set({ outs, supported, named });
+
+  const keys = new Set(outs.map((o) => o.key));
+  if (!initial) {
+    const added = outs.filter((o) => !prevKeys.has(o.key));
+    const removed = [...prevKeys].filter((k) => !keys.has(k));
+    const s = settings.get();
+    if (removed.length && player.get().playing && s.pauseOnDisconnect) {
+      pausedByDisconnect = true;
+      engine.pause();
+      toast(`${removed[0]} disconnected — paused`);
+    }
+    for (const a of added) {
+      const pid = s.deviceMap[a.key];
+      const prof = s.profiles.find((p) => p.id === pid);
+      if (prof) {
+        applyProfile(prof);
+        toast(`${a.label} — profile "${prof.name}" applied`);
+      } else if (HEADSET.test(a.label)) {
+        toast(`${a.label} connected`);
+      }
+      if (s.autoResume && pausedByDisconnect) {
+        pausedByDisconnect = false;
+        window.setTimeout(() => void engine.play(), 600);
+      }
+    }
+  } else {
+    const s = settings.get();
+    const hit = outs.find((o) => s.deviceMap[o.key]);
+    const prof = hit && s.profiles.find((p) => p.id === s.deviceMap[hit.key]);
+    if (prof) applyProfile(prof);
+  }
+  player.set({
+    outputLabel: outs.find((o) => o.id !== "default" && HEADSET.test(o.label))?.label || "",
+  });
+  prevKeys = keys;
+}
 
 async function scan(initial = false) {
-  if (typeof navigator === "undefined") return;
-  const md = navigator.mediaDevices;
-  if (!md?.enumerateDevices) return;
   try {
+    if (isNative()) {
+      const result = await SonoraPlayer.getAudioOutputs();
+      publishScan(result.outs, initial, result.supported);
+      return;
+    }
+    if (typeof navigator === "undefined") return;
+    const md = navigator.mediaDevices;
+    if (!md?.enumerateDevices) return;
     const list = (await md.enumerateDevices()).filter((d) => d.kind === "audiooutput" || d.kind === "audioinput");
     const outsRaw = list.filter((d) => d.kind === "audiooutput");
-    // On Android WebView outputs often aren't listed; headset mics are a good proxy
+    // Some browsers do not expose output endpoints; input devices are a name-only proxy.
     const src = outsRaw.length ? outsRaw : list.filter((d) => d.kind === "audioinput");
     const outs = src.map((d) => ({
       id: d.deviceId || "default",
       label: d.label || (d.deviceId === "default" ? "System default output" : "Audio output device"),
       key: keyFor(d),
     }));
-    const named = outs.some((o) => o.label && o.label !== "Audio output device" && o.label !== "System default output");
-    devices.set({ outs, supported: true, named });
-
-    const keys = new Set(outs.map((o) => o.key));
-    if (!initial) {
-      const added = outs.filter((o) => !prevKeys.has(o.key));
-      const removed = [...prevKeys].filter((k) => !keys.has(k));
-      const s = settings.get();
-      if (removed.length && player.get().playing && s.pauseOnDisconnect) {
-        engine.pause();
-        pausedByDisconnect = true;
-        toast(`${removed[0]} disconnected — paused`);
-      }
-      for (const a of added) {
-        const pid = s.deviceMap[a.key];
-        const prof = s.profiles.find((p) => p.id === pid);
-        if (prof) {
-          applyProfile(prof);
-          toast(`${a.label} — profile "${prof.name}" applied`);
-        } else if (HEADSET.test(a.label)) {
-          toast(`${a.label} connected`);
-        }
-        if (s.autoResume && pausedByDisconnect) {
-          pausedByDisconnect = false;
-          setTimeout(() => engine.play(), 600);
-        }
-      }
-    } else {
-      const s = settings.get();
-      const hit = outs.find((o) => s.deviceMap[o.key] && o.id !== "default" && o.id !== "communications");
-      const prof = hit && s.profiles.find((p) => p.id === s.deviceMap[hit.key]);
-      if (prof) applyProfile(prof);
-    }
-    player.set({ outputLabel: outs.find((o) => o.id !== "default" && HEADSET.test(o.label))?.label || "" });
-    prevKeys = keys;
-  } catch {}
+    publishScan(outs, initial);
+  } catch {
+    if (isNative()) devices.set({ outs: [], supported: true, named: false });
+  }
 }
 
 export function initDevices() {
+  if (isNative()) {
+    void scan(true);
+    void SonoraPlayer.addListener("audioDevicesChanged", () => void scan()).catch(() => {});
+    return;
+  }
   if (typeof navigator === "undefined") return;
   const md = navigator.mediaDevices;
   if (!md?.enumerateDevices) return;
-  scan(true);
-  md.addEventListener?.("devicechange", () => scan());
+  void scan(true);
+  md.addEventListener?.("devicechange", () => void scan());
 }
 
-/**
- * Only requests audio permission when the user explicitly clicks "Unlock device names"
- */
+/** Pause once on Android's noisy-output broadcast and let the device callback handle auto-resume. */
+export function handleBecomingNoisy() {
+  if (!settings.get().pauseOnDisconnect || !player.get().playing) return;
+  pausedByDisconnect = true;
+  engine.pause();
+  toast("Audio output disconnected — paused");
+}
+
+/** On Android, output names come from AudioManager and do not require microphone access. */
 export async function requestDeviceNames() {
+  if (isNative()) {
+    await scan(true);
+    toast(devices.get().named ? "Headset names refreshed" : "No named headset is connected");
+    return;
+  }
   try {
     const s = await navigator.mediaDevices.getUserMedia({ audio: true });
     s.getTracks().forEach((t) => t.stop());
-    await scan();
+    await scan(true);
     toast("Device names unlocked");
   } catch {
     toast("Permission denied — device names stay hidden");
