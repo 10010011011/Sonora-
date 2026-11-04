@@ -1035,6 +1035,15 @@ class Engine {
       this.active = o;
       library.set({ qpos: pos, insertCursor: 0 });
       this.afterTrackChange();
+      diag("track-switch", {
+        via: duration > 0.05 ? "crossfade" : "gapless",
+        remainingMs: Math.round(remaining * 1000),
+        hidden: document.hidden,
+      });
+      if (this.switchMarkAt) {
+        diag("switch-latency", { ms: Math.round(performance.now() - this.switchMarkAt), hidden: document.hidden });
+        this.switchMarkAt = 0;
+      }
       // A manual skip can start from a paused queue. The new deck's play event may
       // have fired before active was switched, so update transport state explicitly.
       if (!wasPlaying) this.onPlayState(true);
