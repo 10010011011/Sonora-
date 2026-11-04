@@ -987,6 +987,7 @@ class Engine {
     }
 
     const oldPos = library.get().qpos;
+    const wasPlaying = player.get().playing;
     const token = ++this.switchToken;
     this.crossfading = true; // also guards ended while the next deck's play promise settles
     try { eo.currentTime = 0; } catch { /* the browser will start at its current position */ }
@@ -1034,6 +1035,9 @@ class Engine {
       this.active = o;
       library.set({ qpos: pos, insertCursor: 0 });
       this.afterTrackChange();
+      // A manual skip can start from a paused queue. The new deck's play event may
+      // have fired before active was switched, so update transport state explicitly.
+      if (!wasPlaying) this.onPlayState(true);
 
       if (duration > 0.05) {
         window.setTimeout(() => {
