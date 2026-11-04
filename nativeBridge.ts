@@ -68,8 +68,10 @@ export function initNativeBridge() {
   /* ---------------- Audio focus ---------------- */
   engine.hooks.beforePlay = async () => {
     if (!localStorage.getItem(NOTIF_ASKED)) {
-      localStorage.setItem(NOTIF_ASKED, "1");
-      void SonoraPlayer.requestNotificationPermission().catch(ignore); // Android 13+: non-blocking prompt
+      void SonoraPlayer.requestNotificationPermission().then(({ granted }) => {
+        // Record the result only after Android has answered. Settings exposes a manual retry.
+        localStorage.setItem(NOTIF_ASKED, granted ? "granted" : "denied");
+      }).catch(ignore);
     }
     try {
       return (await SonoraPlayer.requestFocus()).granted;
