@@ -45,6 +45,8 @@ export interface UserData {
   bookmarks: Bookmark[];
   resume: ResumeState;
   trackConfigs?: Record<string, TrackAudioConfig>;
+  /** Stable track ids in the user's manual all-songs order. */
+  libraryOrder: string[];
 }
 
 const empty = (): UserData => ({
@@ -53,6 +55,7 @@ const empty = (): UserData => ({
   bookmarks: [],
   resume: { last: null, byTrack: {} },
   trackConfigs: {},
+  libraryOrder: [],
 });
 
 export const userdata = createStore<UserData>(empty(), "sonora.userdata.v1");
@@ -76,6 +79,9 @@ export function normalizeUserData(raw: unknown): UserData {
       byTrack: r.resume?.byTrack && typeof r.resume.byTrack === "object" ? { ...r.resume.byTrack } : {},
     },
     trackConfigs: r.trackConfigs && typeof r.trackConfigs === "object" ? { ...r.trackConfigs } : {},
+    libraryOrder: Array.isArray(r.libraryOrder)
+      ? [...new Set(r.libraryOrder.filter((id): id is string => typeof id === "string"))]
+      : [],
   };
 }
 
@@ -269,6 +275,7 @@ export function remapUserData(data: UserData, idMap: Map<string, string>): UserD
     bookmarks: data.bookmarks.map((b) => ({ ...b, trackId: m(b.trackId) })),
     resume: { last: data.resume.last ? { ...data.resume.last, trackId: m(data.resume.last.trackId) } : null, byTrack },
     trackConfigs,
+    libraryOrder: [...new Set((data.libraryOrder ?? []).map(m))],
   };
 }
 
@@ -285,6 +292,7 @@ export function mergeUserData(local: UserData, incoming: UserData): UserData {
       byTrack: { ...incoming.resume.byTrack, ...local.resume.byTrack },
     },
     trackConfigs: { ...(incoming.trackConfigs ?? {}), ...(local.trackConfigs ?? {}) },
+    libraryOrder: [...new Set([...(local.libraryOrder ?? []), ...(incoming.libraryOrder ?? [])])],
   };
 }
 
