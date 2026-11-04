@@ -234,6 +234,7 @@ class Engine {
   ctx: AudioContext | null = null;
   els: HTMLAudioElement[];
   slotPos: (number | null)[] = [null, null];
+  private slotLoadId: number[] = [0, 0];
   active = 0;
 
   private rg: GainNode[] = [];
@@ -279,6 +280,8 @@ class Engine {
   private gapT: number | undefined;
   private pauseFadeT: number | undefined;
   private crossfading = false;
+  /** Invalidates a queued deck transition when the user changes transport or queue state. */
+  private switchToken = 0;
   private suspendT: number | undefined;
 
   private worker: Worker | null = null;
@@ -348,18 +351,43 @@ class Engine {
       el.addEventListener("error", () => {
         if (i !== this.active || !el.src) return;
         const mediaError = el.error;
-        diag("media-error", {
+        const source = el.currentSrc || el.src;
+        const loadId = this.slotLoadId[i];
+        const pos = this.slotPos[i];
+        const track = pos == null ? undefined : this.trackAt(pos);
+        const details = {
           code: mediaError?.code ?? 0,
           message: mediaError?.message ?? "",
           networkState: el.networkState,
           readyState: el.readyState,
-          source: el.currentSrc || el.src,
-        });
+          source,
+          loadId,
+          trackId: track?.id ?? "",
+          title: track?.title ?? "",
+          fileName: track?.fileName ?? "",
+          mime: track?.mime ?? "",
+          size: track?.size ?? 0,
+        };
+        diag("media-error", details);
+        // Chromium reports MEDIA_ERR_ABORTED (1) when a source is deliberately replaced,
+        // a deck is paused, or a pending load is superseded. It is not evidence of a bad song.
+        if (mediaError?.code === 1) {
+          diag("media-abort-ignored", details);
+          return;
+        }
         toast(mediaError?.code === 4
-          ? "This audio format or file location isn't supported — skipping"
-          : "Could not read this audio file — skipping");
-        setTimeout(() => {
-          if (i === this.active && el.error) this.next();
+          ? "This audio format or file location isn't supported"
+          : "Could not read this audio file");
+        window.setTimeout(() => {
+          if (
+            i !== this.active ||
+            this.slotLoadId[i] !== loadId ||
+            this.slotPos[i] !== pos ||
+            (el.currentSrc || el.src) !== source ||
+            !el.error
+          ) return;
+          diag("media-error-advance", { ...details, hidden: document.hidden });
+          void this.next();
         }, 400);
       });
     });
@@ -836,9 +864,13 @@ class Engine {
     const t = this.trackAt(pos);
     if (!t) return;
     const el = this.els[slot];
+    this.slotLoadId[slot]++;
+    el.pause();
     el.src = t.url; // streamed by the browser / native media server, never copied into JS
     el.loop = false;
     this.slotPos[slot] = pos;
+    // Explicitly restart the load so an older aborted request cannot leak into this deck's state.
+    try { el.load(); } catch { /* WebView may already have started loading the new source. */ }
     this.applyElementSettings(settings.get());
     if (this.ctx) this.rg[slot].gain.value = dB(this.rgFor(t));
   }
@@ -940,43 +972,103 @@ class Engine {
     if (player.get().repeatRemaining > 0) return false;
     if (this.checkSleepTrackEnd()) return true;
 
-    const t = this.ctx.currentTime;
     const eo = this.els[o];
-    eo.currentTime = 0;
-    this.switchMarkAt = performance.now();
-    diag("track-switch", {
-      via: fadeSec > 0.05 ? "crossfade" : "gapless",
-      remainingMs: Math.round(((this.els[old].duration || 0) - this.els[old].currentTime) * 1000),
-      hidden: document.hidden,
-    });
+    // Do not hand over to a deck that has not buffered even its first frame. The old
+    // implementation switched active decks before play() succeeded, so a slow preload
+    // could fade the old song out and silently skip the next one.
+    if (eo.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      diag("transition-not-ready", {
+        target: this.trackAt(pos)?.id ?? "",
+        readyState: eo.readyState,
+        networkState: eo.networkState,
+        hidden: document.hidden,
+      });
+      return false;
+    }
 
-    if (fadeSec > 0.05) {
-      this.crossfading = true;
+    const oldPos = library.get().qpos;
+    const token = ++this.switchToken;
+    this.crossfading = true; // also guards ended while the next deck's play promise settles
+    try { eo.currentTime = 0; } catch { /* the browser will start at its current position */ }
+    this.switchMarkAt = performance.now();
+
+    let attempt: Promise<void>;
+    try {
+      attempt = eo.play();
+    } catch (error) {
+      this.crossfading = false;
+      diag("transition-play-rejected", {
+        name: error instanceof Error ? error.name : "Error",
+        message: error instanceof Error ? error.message : String(error),
+        target: this.trackAt(pos)?.id ?? "",
+        readyState: eo.readyState,
+      });
+      return false;
+    }
+
+    attempt.then(() => {
+      // Queue edits, an explicit track pick, or a pause can invalidate this transition.
+      if (token !== this.switchToken || this.active !== old ||
+          library.get().qpos !== oldPos || this.slotPos[o] !== pos) {
+        eo.pause();
+        return;
+      }
+      const t = this.ctx?.currentTime ?? 0;
+      const oldEl = this.els[old];
+      const remaining = Number.isFinite(oldEl.duration)
+        ? Math.max(0, (oldEl.duration - oldEl.currentTime) / (oldEl.playbackRate || 1))
+        : fadeSec;
+      const duration = fadeSec > 0.05 ? Math.min(fadeSec, remaining || fadeSec) : 0;
       this.fade[o].gain.cancelScheduledValues(t);
-      this.fade[o].gain.setValueAtTime(0.0001, t);
-      this.fade[o].gain.linearRampToValueAtTime(1, t + fadeSec);
       this.fade[old].gain.cancelScheduledValues(t);
-      this.fade[old].gain.setValueAtTime(this.fade[old].gain.value, t);
-      this.fade[old].gain.linearRampToValueAtTime(0, t + fadeSec);
-      window.setTimeout(() => {
-        this.els[old].pause();
+      if (duration > 0.05) {
+        this.fade[o].gain.setValueAtTime(0.0001, t);
+        this.fade[o].gain.linearRampToValueAtTime(1, t + duration);
+        this.fade[old].gain.setValueAtTime(Math.max(0.0001, this.fade[old].gain.value), t);
+        this.fade[old].gain.linearRampToValueAtTime(0, t + duration);
+      } else {
+        this.fade[o].gain.value = 1;
+        this.fade[old].gain.value = 0;
+      }
+
+      this.active = o;
+      library.set({ qpos: pos, insertCursor: 0 });
+      this.afterTrackChange();
+
+      if (duration > 0.05) {
+        window.setTimeout(() => {
+          if (token !== this.switchToken) return;
+          oldEl.pause();
+          this.crossfading = false;
+          this.preloadNext();
+        }, duration * 1000 + 60);
+      } else {
+        oldEl.pause();
         this.crossfading = false;
         this.preloadNext();
-      }, fadeSec * 1000 + 60);
-    } else {
-      this.fade[o].gain.cancelScheduledValues(t);
-      this.fade[o].gain.value = 1;
-      this.fade[old].gain.value = 0;
-      this.els[old].pause();
-    }
-    eo.play().catch(() => {});
-    this.active = o;
-    library.set({ qpos: pos, insertCursor: 0 });
-    this.afterTrackChange();
+      }
+    }).catch((error: unknown) => {
+      if (token !== this.switchToken) return;
+      this.crossfading = false;
+      eo.pause();
+      this.fade[o].gain.value = 0;
+      const failure = error instanceof Error ? error : new Error(String(error));
+      diag("transition-play-rejected", {
+        name: failure.name,
+        message: failure.message,
+        target: this.trackAt(pos)?.id ?? "",
+        readyState: eo.readyState,
+        networkState: eo.networkState,
+      });
+      // If the previous track already ended while this deck was starting, retry the
+      // same target on the active element rather than advancing the queue a second time.
+      if (this.els[old].ended || this.els[old].paused) void this.playAt(pos, true);
+    });
     return true;
   }
 
   private cancelFade() {
+    this.switchToken++;
     if (!this.crossfading || !this.ctx) return;
     this.crossfading = false;
     this.fade.forEach((f) => f.gain.cancelScheduledValues(0));
@@ -1054,8 +1146,7 @@ class Engine {
       return;
     }
     diag("track-ended-fallback", { hidden: document.hidden, preloaded: this.slotPos[1 - this.active] === n });
-    if (this.slotPos[1 - this.active] === n) this.startOther(0);
-    else this.playAt(n, true);
+    if (!this.startOther(0)) void this.playAt(n, true);
   }
 
   private onPlayState(p: boolean) {
@@ -1116,8 +1207,17 @@ class Engine {
     const o = 1 - this.active;
     if (this.slotPos[o] == null) return;
     if (s.crossfade > 0 && rem <= s.crossfade && rem > 0.2) this.startOther(rem);
-    else if (s.gapless && s.crossfade === 0 && rem < 0.15 && this.gapT == null) {
-      this.gapT = window.setTimeout(() => this.startOther(0), Math.max(0, rem * 1000 - 12));
+    else if ((s.gapless || s.crossfade === 0) && rem < 0.15 && this.gapT == null) {
+      this.gapT = window.setTimeout(() => {
+        this.gapT = undefined;
+        if (!this.startOther(0)) {
+          // onEnded() will retry on the active deck once this track reaches its end.
+          diag("gapless-preload-not-ready", {
+            target: this.trackAt(this.slotPos[o] ?? -1)?.id ?? "",
+            readyState: this.els[o].readyState,
+          });
+        }
+      }, Math.max(0, rem * 1000 - 12));
     }
   }
 
@@ -1196,14 +1296,20 @@ class Engine {
     player.get().playing ? this.pause() : this.play();
   }
 
-  next() {
+  async next() {
     const n = this.nextPos(library.get().qpos, true);
     if (n < 0) return;
-    if (!player.get().playing) void this.hooks.beforePlay?.();
+    // Acquire the platform's play permission before a paused manual skip, exactly once.
+    if (!player.get().playing && this.hooks.beforePlay && !(await this.hooks.beforePlay())) {
+      this.focusDenied();
+      return;
+    }
+    if (!player.get().playing && this.ctx) await this.ctx.resume();
     if (this.slotPos[1 - this.active] === n && this.ctx && settings.get().repeat !== "one" && !this.crossfading) {
-      this.startOther(0);
-      if (!player.get().playing) this.ctx.resume();
-    } else this.playAt(n);
+      if (this.startOther(0)) return;
+    }
+    // If the preload is still loading, replace the current deck and let play() wait for it.
+    await this.playAt(n, true);
   }
 
   prev() {
@@ -1244,6 +1350,7 @@ class Engine {
   }
 
   requeue() {
+    this.cancelFade();
     this.slotPos[1 - this.active] = null;
     this.preloadNext();
   }
