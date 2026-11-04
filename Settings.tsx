@@ -4,7 +4,7 @@ import { useStore, settings, player, toast, type ThemeName } from "./store";
 import { devices, requestDeviceNames } from "./devices";
 import { Icon } from "./ui";
 import { Calibrate } from "./SharedAudioViews";
-import { getLibraryStats } from "./nativeLibrary";
+import { getLibraryStats, SonoraPlayer } from "./nativeLibrary";
 import { diagReport } from "./diag";
 import { useBackHandler } from "./useBack";
 import { useFocusTrap } from "./focusTrap";
@@ -47,6 +47,18 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     if (Capacitor.isNativePlatform()) getLibraryStats().then(setStats).catch(() => {});
   }, []);
+
+  const requestNotificationAccess = async () => {
+    try {
+      const { granted } = await SonoraPlayer.requestNotificationPermission();
+      localStorage.setItem("sonora.notifAsked", granted ? "granted" : "denied");
+      toast(granted
+        ? "Notification access is enabled"
+        : "Notification access is blocked. Check Android app notification settings.");
+    } catch {
+      toast("Could not check notification access");
+    }
+  };
 
   const copyDiagnostics = async () => {
     try {
@@ -419,6 +431,17 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
               </button>
             </div>
 
+            {Capacitor.isNativePlatform() && (
+              <div className="setting-line">
+                <div>
+                  <b>Notification access</b>
+                  <span>Retry Android's notification permission request. Media controls also depend on the active playback session.</span>
+                </div>
+                <button type="button" className="outline-button h-8 px-3 text-xs" onClick={requestNotificationAccess}>
+                  Check access
+                </button>
+              </div>
+            )}
             {(!named || Capacitor.isNativePlatform()) && (
               <div className="setting-line">
                 <div>
