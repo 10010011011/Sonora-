@@ -43,6 +43,7 @@ const SORTS: { id: SortKey; label: string }[] = [
   { id: "recent", label: "Recently added" },
   { id: "played", label: "Most played" },
   { id: "duration", label: "Longest" },
+  { id: "manual", label: "Manual (drag to reorder)" },
 ];
 
 const FILTERS: { id: LibraryFilter; label: string }[] = [
@@ -53,7 +54,7 @@ const FILTERS: { id: LibraryFilter; label: string }[] = [
   { id: "withLyrics", label: "Lyrics" },
 ];
 
-export function sortIndices(indices: number[], tracks: Track[], key: SortKey): number[] {
+export function sortIndices(indices: number[], tracks: Track[], key: SortKey, libraryOrder: string[] = []): number[] {
   const out = [...indices];
   const by = (f: (t: Track) => string) => (a: number, b: number) => collator.compare(f(tracks[a]), f(tracks[b])) || a - b;
   switch (key) {
@@ -62,6 +63,17 @@ export function sortIndices(indices: number[], tracks: Track[], key: SortKey): n
     case "recent": return out.sort((a, b) => (tracks[b].addedAt ?? 0) - (tracks[a].addedAt ?? 0) || b - a);
     case "played": return out.sort((a, b) => (tracks[b].playCount ?? 0) - (tracks[a].playCount ?? 0) || collator.compare(tracks[a].title, tracks[b].title));
     case "duration": return out.sort((a, b) => (tracks[b].duration ?? 0) - (tracks[a].duration ?? 0));
+    case "manual": {
+      const rank = new Map(libraryOrder.map((id, i) => [id, i]));
+      return out.sort((a, b) => {
+        const ai = rank.get(tracks[a]?.id);
+        const bi = rank.get(tracks[b]?.id);
+        if (ai === undefined && bi === undefined) return a - b;
+        if (ai === undefined) return 1;
+        if (bi === undefined) return -1;
+        return ai - bi;
+      });
+    }
     default: return out.sort(by((t) => t.title));
   }
 }
@@ -461,6 +473,7 @@ export default function Library({
   const likedIds = useStore(settings, (s) => s.likedIds);
   const sort = useStore(settings, (s) => s.librarySort);
   const playlists = useStore(userdata, (u) => u.playlists);
+  const libraryOrder = useStore(userdata, (u) => u.libraryOrder);
   const lyrMap = useStore(lyricsStore, (s) => s.map);
 
   const [mode, setMode] = useState<Mode>("songs");
@@ -492,18 +505,29 @@ export default function Library({
     if (group?.kind === "playlist") return kept;
     const effectiveSort: SortKey =
       filter === "mostPlayed" ? "played" : group?.kind === "album" ? "album" : sort;
-    return sortIndices(kept, tracks, effectiveSort);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tracks, group, q, filter, likedIds, sort, lyrMap]);
+    return sortIndices(kept, tracks, effectiveSort, libraryOrder);
+  }, [tracks, group, q, filter, likedIds, sort, lyrMap, libraryOrder]);
 
-  // Long-press drag is only offered on an unfiltered playlist, where list positions match the stored order.
-  const canReorder = group?.kind === "playlist" && filter === "all" && !q.trim();
+  // Playlist order is stored in the playlist; the all-songs order is saved separately by track id.
+  const canReorderPlaylist = group?.kind === "playlist" && filter === "all" && !q.trim();
+  const canReorderLibrary = !group && mode === "songs" && filter === "all" && !q.trim();
+  const canReorder = canReorderPlaylist || canReorderLibrary;
   const reorderPlaylist = (from: number, to: number) => {
     const pl = playlists.find((x) => x.id === group?.playlistId);
     if (!pl) return;
     const a = pl.trackIds.indexOf(tracks[list[from]]?.id);
     const b = pl.trackIds.indexOf(tracks[list[to]]?.id);
     if (a >= 0 && b >= 0) movePlaylistTrack(pl.id, a, b);
+  };
+
+  const reorderLibrary = (from: number, to: number) => {
+    const next = [...list];
+    if (from < 0 || to < 0 || from >= next.length || to >= next.length || from === to) return;
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    userdata.set({ libraryOrder: next.map((i) => tracks[i]?.id).filter((id): id is string => !!id) });
+    settings.set({ librarySort: "manual" });
+    toast("Manual song order saved");
   };
 
   const shownGroups = useMemo(() => {
@@ -712,13 +736,17 @@ export default function Library({
             <span>DURATION</span>
           </div>
           {canReorder && list.length > 1 && (
-            <p className="library-footnote">Press and hold a song, then drag it to reorder this playlist.</p>
+            <p className="library-footnote">
+              Press and hold a song, then drag to reorder {canReorderPlaylist ? "this playlist" : "your library"}.
+            </p>
           )}
           <TrackList
             list={list}
             tracks={tracks}
             playlistId={group?.playlistId}
-            onReorder={canReorder ? reorderPlaylist : undefined}
+            onReorder={
+              canReorderPlaylist ? reorderPlaylist : canReorderLibrary ? reorderLibrary : undefined
+            }
             empty={
               filter === "liked"
                 ? "No liked songs yet."
