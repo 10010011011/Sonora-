@@ -6,8 +6,13 @@ import android.content.ClipData;
 import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
+import android.media.AudioDeviceCallback;
+import android.media.AudioDeviceInfo;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.StatFs;
 import android.provider.DocumentsContract;
 import android.util.Base64;
@@ -65,6 +70,15 @@ public class SonoraPlayerPlugin extends Plugin {
         return t;
     });
     private LibraryStore store;
+    private AudioManager audioManager;
+    private final AudioDeviceCallback audioDeviceCallback = new AudioDeviceCallback() {
+        @Override public void onAudioDevicesAdded(AudioDeviceInfo[] addedDevices) {
+            notifyListeners("audioDevicesChanged", new JSObject(), true);
+        }
+        @Override public void onAudioDevicesRemoved(AudioDeviceInfo[] removedDevices) {
+            notifyListeners("audioDevicesChanged", new JSObject(), true);
+        }
+    };
     private volatile LibraryImporter importer;
     private final Map<String, MigrationJob> migrations = new HashMap<>();
 
@@ -76,11 +90,20 @@ public class SonoraPlayerPlugin extends Plugin {
     public void load() {
         instance = this;
         store = LibraryStore.get(getContext());
+        if (Build.VERSION.SDK_INT >= 23) {
+            audioManager = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+            if (audioManager != null) {
+                audioManager.registerAudioDeviceCallback(audioDeviceCallback, new Handler(Looper.getMainLooper()));
+            }
+        }
         upkeep.execute(this::runUpkeep);
     }
 
     @Override
     protected void handleOnDestroy() {
+        if (Build.VERSION.SDK_INT >= 23 && audioManager != null) {
+            try { audioManager.unregisterAudioDeviceCallback(audioDeviceCallback); } catch (RuntimeException ignored) { }
+        }
         if (instance == this) instance = null;
         super.handleOnDestroy();
     }
@@ -682,6 +705,49 @@ public class SonoraPlayerPlugin extends Plugin {
         if (job == null) return;
         try { job.out.close(); } catch (IOException ignored) { }
         job.tmp.delete();
+    }
+
+    /* ------------------------------------------------------------------ audio output devices */
+
+    /** Lists connected external outputs using AudioManager; no microphone or Bluetooth permission is needed. */
+    @PluginMethod
+    public void getAudioOutputs(PluginCall call) {
+        JSArray outputs = new JSArray();
+        if (Build.VERSION.SDK_INT >= 23 && audioManager != null) {
+            AudioDeviceInfo[] devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS);
+            for (AudioDeviceInfo device : devices) {
+                String label = device.getProductName() == null ? "" : device.getProductName().toString().trim();
+                if (label.isEmpty()) label = outputTypeName(device.getType());
+                if (label.isEmpty()) continue;
+                String key = label.replaceAll("\\s*\\(.*?\\)\\s*$", "").trim();
+                outputs.put(new JSObject()
+                    .put("id", "android-audio-" + device.getId())
+                    .put("label", label)
+                    .put("key", key.isEmpty() ? label : key));
+            }
+        }
+        call.resolve(new JSObject().put("outs", outputs).put("supported", Build.VERSION.SDK_INT >= 23));
+    }
+
+    private static String outputTypeName(int type) {
+        switch (type) {
+            case AudioDeviceInfo.TYPE_WIRED_HEADSET: return "Wired headset";
+            case AudioDeviceInfo.TYPE_WIRED_HEADPHONES: return "Wired headphones";
+            case AudioDeviceInfo.TYPE_BLUETOOTH_SCO: return "Bluetooth headset";
+            case AudioDeviceInfo.TYPE_BLUETOOTH_A2DP: return "Bluetooth audio";
+            case AudioDeviceInfo.TYPE_USB_DEVICE: return "USB audio";
+            case AudioDeviceInfo.TYPE_USB_HEADSET: return "USB headset";
+            case AudioDeviceInfo.TYPE_HEARING_AID: return "Hearing aid";
+            case AudioDeviceInfo.TYPE_BLE_HEADSET: return "Bluetooth LE headset";
+            case AudioDeviceInfo.TYPE_BLE_SPEAKER: return "Bluetooth LE speaker";
+            case AudioDeviceInfo.TYPE_HDMI:
+            case AudioDeviceInfo.TYPE_HDMI_ARC: return "HDMI audio";
+            case AudioDeviceInfo.TYPE_LINE_ANALOG:
+            case AudioDeviceInfo.TYPE_LINE_DIGITAL: return "Line output";
+            case AudioDeviceInfo.TYPE_AUX_LINE: return "Auxiliary audio";
+            case AudioDeviceInfo.TYPE_DOCK: return "Dock audio";
+            default: return "";
+        }
     }
 
     /* ------------------------------------------------------------------ media session / focus */
