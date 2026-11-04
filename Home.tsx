@@ -5,6 +5,7 @@ import { useCurrent } from "./Player";
 import { playIndices, playShuffled } from "./queue";
 import { Icon, Cover, Chip } from "./ui";
 import { TrackList, sortIndices } from "./Library";
+import { userdata } from "./userdata";
 
 export default function Home({
   onNavigate,
@@ -16,9 +17,22 @@ export default function Home({
   const tracks = useStore(library, (s) => s.tracks);
   const likedIds = useStore(settings, (s) => s.likedIds);
   const sort = useStore(settings, (s) => s.librarySort);
+  const libraryOrder = useStore(userdata, (u) => u.libraryOrder);
 
-  // Every song, in the library's chosen sort order. Albums, artists, folders and playlists live in Library.
-  const list = useMemo(() => sortIndices(tracks.map((_, i) => i), tracks, sort), [tracks, sort]);
+  // Every song, in the chosen sort order; saved manual order follows the tracks by id.
+  const list = useMemo(
+    () => sortIndices(tracks.map((_, i) => i), tracks, sort, libraryOrder),
+    [tracks, sort, libraryOrder],
+  );
+
+  const reorderAllSongs = (from: number, to: number) => {
+    const next = [...list];
+    if (from < 0 || to < 0 || from >= next.length || to >= next.length || from === to) return;
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    userdata.set({ libraryOrder: next.map((i) => tracks[i]?.id).filter((id): id is string => !!id) });
+    settings.set({ librarySort: "manual" });
+  };
 
   const startMix = (mode: "mostPlayed" | "rediscover" | "liked") => {
     if (!tracks.length) return;
@@ -130,7 +144,14 @@ export default function Home({
             <h2>All songs</h2>
             <span className="text-sm text-muted tabular-nums">{tracks.length}</span>
           </div>
-          <TrackList list={list} tracks={tracks} tall empty="Your imported songs will appear here." />
+          <p className="library-footnote">Press and hold a song, then drag it to set your manual order.</p>
+          <TrackList
+            list={list}
+            tracks={tracks}
+            tall
+            onReorder={reorderAllSongs}
+            empty="Your imported songs will appear here."
+          />
         </section>
       )}
     </div>
