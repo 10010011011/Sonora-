@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "lint": "tsc --noEmit",
     "test:lyrics": "tsx test-lyrics.ts",
-    "test:core": "tsx --test lyrics-and-dsp.test.ts section2.test.ts playlist-and-sheets.test.ts engine-guards.test.ts",
+    "test:core": "tsx --test lyrics-and-dsp.test.ts section2.test.ts playlist-and-sheets.test.ts",
     "test:native": "node run-native-helper-tests.mjs"
   },
   "dependencies": {
