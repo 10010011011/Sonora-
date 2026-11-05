@@ -32,15 +32,9 @@ jobs:
           manifest = json.loads(package.read_text())
           assert manifest["version"] == "1.2.0"
           assert "playlist-and-sheets.test.ts" in manifest["scripts"]["test:core"]
-          workflow = Path(".github/workflows/android.yml")
-          text = workflow.read_text()
-          old = "run: npx tsx --test lyrics-and-dsp.test.ts section2.test.ts"
-          assert text.count(old) == 1, "Could not uniquely locate the existing core regression-test command"
-          workflow.write_text(text.replace(old, "run: npm run test:core"))
           PY
           rm -rf .sonora-upload-parts
           rm -f .gitkeep "sonora-github-flat-v3 (1).zip"
-          rm -f .github/workflows/apply-claude-1.2.0.yml
           git diff --check
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
