@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   apply-and-build:
-    if: github.event_name == 'push' && contains(toJson(github.event.head_commit.added), '.sonora-upload-parts/part-01.b64')
+    if: github.event_name == 'push' && github.event.head_commit.message == 'Trigger Claude Sonora 1.2.0 application'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
