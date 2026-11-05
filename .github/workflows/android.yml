@@ -39,7 +39,7 @@ jobs:
       - name: Lyrics parser regression tests
         run: npm run test:lyrics
       - name: Core regression tests
-        run: npx tsx --test lyrics-and-dsp.test.ts section2.test.ts
+        run: npm run test:core
       - name: Native helper tests
         run: npm run test:native
       - name: Create Android project
