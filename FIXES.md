@@ -14,3 +14,15 @@ Version bumped to 1.2.0 (so it installs over your current build).
 
 ## Not confirmed
 "Roundabout" – the cause can't be determined without the file. If it still fails, the toast now names the format; the diagnostics export (Settings → Copy diagnostics) shows the exact media error code.
+
+
+## 1.2.1 follow-up
+
+- **Interrupted WebAudio recovery** – watch AudioContext state, retry resume while playback is active, and restore the media element to its last audible position after a suspended/interrupted interval. Crossfade and end transitions wait until the context is running.
+- **Duplicate transport commands** – debounce repeated Next/Previous dispatches for 350 ms to prevent Android MediaSession and WebView handlers from double-skipping.
+- **Gapless deck safety** – validate both the queued position and the actual track ID before promoting a preloaded deck; stale preloads are rejected and reloaded.
+- **Media read recovery** – retry once per actual deck load (including mid-track failures), restore just before the interruption point, then advance only if the retry fails. The existing three-consecutive-failure stop remains in place.
+- **Background WebView** – refresh WebView timers on window-focus changes and while either playback or the MediaSession is active.
+- **Empty playlists** – add a direct “Add songs to playlist” action in the empty state and distinguish it from “Copy to another playlist”.
+
+Version bumped to 1.2.1 (Android versionCode 10201).

@@ -2,6 +2,7 @@ import { settings, library, player, clock, toast, applyMidsToEq, type Settings, 
 import { kvGet, kvSet } from "./db";
 import { diag, diagTick } from "./diag";
 import { getTrackAudioConfig } from "./userdata";
+import { isDuplicateSkip, matchesExpectedPreloadedDeck } from "./engineGuards";
 
 const dB = (x: number) => Math.pow(10, x / 20);
 const MAX_ANALYZE_BYTES = 24 * 1024 * 1024; // Skip full decode analysis for files > 24 MB
@@ -235,6 +236,7 @@ class Engine {
   ctx: AudioContext | null = null;
   els: HTMLAudioElement[];
   slotPos: (number | null)[] = [null, null];
+  private slotTrackId: (string | null)[] = [null, null];
   private slotLoadId: number[] = [0, 0];
   active = 0;
 
@@ -271,7 +273,7 @@ class Engine {
   private limiter!: DynamicsCompressorNode;
   private limiterOn: boolean | null = null;
   /** Songs that already had their one silent retry (by load id), and consecutive failures since the last good play. */
-  private retried = new Set<number>();
+  private retried = new Set<string>();
   private failStreak = 0;
   private volume!: GainNode;
   private sleepGain!: GainNode;
@@ -287,6 +289,10 @@ class Engine {
   /** Invalidates a queued deck transition when the user changes transport or queue state. */
   private switchToken = 0;
   private suspendT: number | undefined;
+  private contextSuspension: { active: number; loadId: number; trackId: string | null; position: number } | null = null;
+  private contextResumePending = false;
+  private lastSkipAction: "next" | "prev" | "" = "";
+  private lastSkipAt = 0;
 
   private worker: Worker | null = null;
   private workerFailed = false;
@@ -380,20 +386,20 @@ class Engine {
           diag("media-abort-ignored", details);
           return;
         }
-        // A transient failure (file busy, storage hiccup, interrupted read) deserves one quiet second try
-        // before the song is given up on and skipped.
-        if (!this.retried.has(loadId)) {
+        // Retry once per deck load, not once per time-position, to avoid retry loops.
+        const retryKey = `${i}:${loadId}`;
+        const at = el.currentTime || 0;
+        if (!this.retried.has(retryKey)) {
           if (this.retried.size > 50) this.retried.clear();
-          this.retried.add(loadId);
+          this.retried.add(retryKey);
           const wasPlaying = player.get().playing;
-          const at = el.currentTime || 0;
-          diag("media-error-retry", details);
+          diag("media-error-retry", { ...details, at });
           window.setTimeout(() => {
             if (i !== this.active || this.slotLoadId[i] !== loadId || this.slotPos[i] !== pos) return;
             el.addEventListener(
               "loadedmetadata",
               () => {
-                if (at > 0) el.currentTime = at;
+                if (at > 0) el.currentTime = Math.max(0, at - 0.2);
                 if (wasPlaying) void el.play().catch(() => {});
               },
               { once: true },
@@ -446,11 +452,79 @@ class Engine {
     return tracks[queue[pos]];
   }
 
+  /**
+   * WebView can keep advancing the media element while its WebAudio graph is suspended.
+   * Remember the last audible position, resume the graph, then rewind any silently elapsed
+   * segment before allowing crossfade/end-of-track logic to run again.
+   */
+  private recoverAudioContext() {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const state = ctx.state as string;
+    if ((state === "suspended" || state === "interrupted") && player.get().playing) {
+      if (!this.contextSuspension) {
+        const deck = this.active;
+        this.contextSuspension = {
+          active: deck,
+          loadId: this.slotLoadId[deck],
+          trackId: player.get().trackId,
+          position: this.els[deck].currentTime || 0,
+        };
+      }
+      if (!this.contextResumePending) {
+        this.contextResumePending = true;
+        void ctx.resume().then(() => {
+          if ((ctx.state as string) === "running") this.restoreAfterContextSuspension();
+        }).catch(() => {}).finally(() => {
+          this.contextResumePending = false;
+        });
+      }
+      return;
+    }
+    if (state === "running") this.restoreAfterContextSuspension();
+  }
+
+  private restoreAfterContextSuspension() {
+    const snapshot = this.contextSuspension;
+    const ctx = this.ctx;
+    if (!snapshot || !ctx || (ctx.state as string) !== "running") return;
+    this.contextSuspension = null;
+    const ps = player.get();
+    if (
+      !ps.playing ||
+      snapshot.active !== this.active ||
+      snapshot.loadId !== this.slotLoadId[this.active] ||
+      snapshot.trackId !== ps.trackId
+    ) return;
+
+    const el = this.el;
+    const duration = el.duration;
+    const safeEnd = Number.isFinite(duration) && duration > 0 ? Math.max(0, duration - 0.15) : snapshot.position;
+    const resumeAt = Math.min(snapshot.position, safeEnd);
+    const from = el.currentTime;
+    if (el.ended || from > snapshot.position + 0.05) {
+      try { el.currentTime = Math.max(0, resumeAt); } catch { /* keep the browser's current position */ }
+      diag("audio-context-recovery-rewind", { from, to: resumeAt, trackId: ps.trackId });
+    }
+    if (ps.playing && (el.paused || el.ended)) {
+      void el.play().catch((error: unknown) => {
+        diag("audio-context-recovery-play-failed", {
+          name: error instanceof Error ? error.name : "Error",
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+  }
+
   /* ---------------- Graph ---------------- */
   ensure() {
     if (this.ctx) return this.ctx;
     const ctx = new AudioContext({ latencyHint: "playback" });
     this.ctx = ctx;
+    ctx.onstatechange = () => {
+      diag("audio-context-state", ctx.state);
+      this.recoverAudioContext();
+    };
     const g = (v = 1) => {
       const n = ctx.createGain();
       n.gain.value = v;
@@ -918,6 +992,7 @@ class Engine {
     el.src = t.url; // streamed by the browser / native media server, never copied into JS
     el.loop = false;
     this.slotPos[slot] = pos;
+    this.slotTrackId[slot] = t.id;
     // Explicitly restart the load so an older aborted request cannot leak into this deck's state.
     try { el.load(); } catch { /* WebView may already have started loading the new source. */ }
     this.applyElementSettings(settings.get());
@@ -1010,11 +1085,23 @@ class Engine {
     return false;
   }
 
-  private startOther(fadeSec: number) {
+  private startOther(fadeSec: number, expectedPos?: number) {
     const o = 1 - this.active;
     const old = this.active;
     const pos = this.slotPos[o];
     if (pos == null || !this.ctx) return false;
+    if (
+      expectedPos != null &&
+      !matchesExpectedPreloadedDeck(pos, expectedPos, this.slotTrackId[o], this.trackAt(expectedPos)?.id)
+    ) {
+      diag("stale-preload-rejected", {
+        expectedPos,
+        loadedPos: pos,
+        expectedTrackId: this.trackAt(expectedPos)?.id ?? "",
+        loadedTrackId: this.slotTrackId[o] ?? "",
+      });
+      return false;
+    }
     clearTimeout(this.gapT);
     this.gapT = undefined;
     if (settings.get().repeat === "one") return false;
@@ -1170,11 +1257,13 @@ class Engine {
     if (this.crossfading) return;
     const n = this.nextPos(library.get().qpos, true);
     const o = 1 - this.active;
-    if (n < 0 || n === library.get().qpos) {
+    const nextTrack = n >= 0 ? this.trackAt(n) : undefined;
+    if (n < 0 || n === library.get().qpos || !nextTrack) {
       this.slotPos[o] = null;
+      this.slotTrackId[o] = null;
       return;
     }
-    if (this.slotPos[o] === n && this.els[o].src) return;
+    if (matchesExpectedPreloadedDeck(this.slotPos[o], n, this.slotTrackId[o], nextTrack.id) && this.els[o].src) return;
     this.els[o].pause();
     this.loadSlot(o, n);
     if (this.ctx) this.fade[o].gain.value = 0;
@@ -1182,6 +1271,11 @@ class Engine {
 
   private onEnded() {
     if (this.crossfading) return;
+    const contextState = this.ctx?.state as string | undefined;
+    if ((contextState === "suspended" || contextState === "interrupted") && player.get().playing) {
+      this.recoverAudioContext();
+      return;
+    }
     const ps = player.get();
     if (ps.abA != null) {
       this.seek(ps.abA);
@@ -1208,7 +1302,7 @@ class Engine {
       return;
     }
     diag("track-ended-fallback", { hidden: document.hidden, preloaded: this.slotPos[1 - this.active] === n });
-    if (!this.startOther(0)) void this.playAt(n, true);
+    if (!this.startOther(0, n)) void this.playAt(n, true);
   }
 
   private onPlayState(p: boolean) {
@@ -1217,9 +1311,10 @@ class Engine {
     clearInterval(this.tickT);
     clearTimeout(this.suspendT);
     if (p) {
-      this.ctx?.resume();
+      this.recoverAudioContext();
       this.tickT = window.setInterval(() => this.tick(), 50);
     } else {
+      this.contextSuspension = null;
       this.suspendT = window.setTimeout(
         () => this.ctx?.state === "running" && !player.get().playing && this.ctx.suspend(),
         20000
@@ -1248,6 +1343,14 @@ class Engine {
 
     this.checkSleep();
 
+    const contextState = this.ctx?.state as string | undefined;
+    if (contextState === "suspended" || contextState === "interrupted") {
+      this.recoverAudioContext();
+      if (player.get().playing) return;
+    } else if (contextState === "running") {
+      this.restoreAfterContextSuspension();
+    }
+
     if (this.ctx) {
       const red = this.limiterOn ? this.limiter.reduction : 0;
       let clip = false;
@@ -1268,11 +1371,13 @@ class Engine {
     const rem = (dur - t) / (el.playbackRate || 1);
     const o = 1 - this.active;
     if (this.slotPos[o] == null) return;
-    if (s.crossfade > 0 && rem <= s.crossfade && rem > 0.2) this.startOther(rem);
+    const expectedNext = this.nextPos(library.get().qpos, false);
+    if (s.crossfade > 0 && rem <= s.crossfade && rem > 0.2) this.startOther(rem, expectedNext);
     else if (s.gapless && s.crossfade === 0 && rem < 0.15 && this.gapT == null) {
       this.gapT = window.setTimeout(() => {
         this.gapT = undefined;
-        if (!this.startOther(0)) {
+        const expected = this.nextPos(library.get().qpos, false);
+        if (!this.startOther(0, expected)) {
           // onEnded() will retry on the active deck once this track reaches its end.
           diag("gapless-preload-not-ready", {
             target: this.trackAt(this.slotPos[o] ?? -1)?.id ?? "",
@@ -1358,7 +1463,14 @@ class Engine {
     player.get().playing ? this.pause() : this.play();
   }
 
-  async next() {
+  async next(force = false) {
+    const now = Date.now();
+    if (!force && isDuplicateSkip("next", this.lastSkipAction, this.lastSkipAt, now)) {
+      diag("engine-skip-debounced", "next");
+      return;
+    }
+    this.lastSkipAction = "next";
+    this.lastSkipAt = now;
     const n = this.nextPos(library.get().qpos, true);
     if (n < 0) return;
     // Acquire the platform's play permission before a paused manual skip, exactly once.
@@ -1368,13 +1480,20 @@ class Engine {
     }
     if (!player.get().playing && this.ctx) await this.ctx.resume();
     if (this.slotPos[1 - this.active] === n && this.ctx && settings.get().repeat !== "one" && !this.crossfading) {
-      if (this.startOther(0)) return;
+      if (this.startOther(0, n)) return;
     }
     // If the preload is still loading, replace the current deck and let play() wait for it.
     await this.playAt(n, true);
   }
 
-  prev() {
+  prev(force = false) {
+    const now = Date.now();
+    if (!force && isDuplicateSkip("prev", this.lastSkipAction, this.lastSkipAt, now)) {
+      diag("engine-skip-debounced", "prev");
+      return;
+    }
+    this.lastSkipAction = "prev";
+    this.lastSkipAt = now;
     if (this.el.currentTime > 3) return this.seek(0);
     const { qpos, queue } = library.get();
     if (!queue.length) return;

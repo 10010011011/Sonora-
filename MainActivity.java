@@ -61,10 +61,12 @@ public class MainActivity extends BridgeActivity {
     // Public on purpose: BridgeActivity declares these public, so overrides may not narrow them.
     @Override public void onPause() { super.onPause(); keepWebViewRunningWhilePlaying(); }
     @Override public void onStop() { super.onStop(); keepWebViewRunningWhilePlaying(); }
+    @Override public void onWindowFocusChanged(boolean hasFocus) { super.onWindowFocusChanged(hasFocus); keepWebViewRunningWhilePlaying(); }
 
-    /** The WebView owns transport state; keep it responsive while the MediaSession notification is active. */
+    /** The WebView owns transport state; keep it responsive while playing or when the MediaSession notification is active. */
     private void keepWebViewRunningWhilePlaying() {
-        if (!PlaybackService.isSessionActive() || getBridge() == null) return;
+        if (getBridge() == null) return;
+        if (!PlaybackService.isPlaying() && !PlaybackService.isSessionActive()) return;
         WebView webView = getBridge().getWebView();
         if (webView == null) return;
         webView.onResume();

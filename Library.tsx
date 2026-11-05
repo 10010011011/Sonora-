@@ -371,7 +371,18 @@ export function TrackList({
       onScroll={(e) => setScroll(e.currentTarget.scrollTop)}
     >
       {list.length === 0 ? (
-        <div className="workspace-empty">{empty}</div>
+        <div className="workspace-empty flex flex-col items-center gap-3 py-6 text-center">
+          <p>{empty}</p>
+          {playlistId && (
+            <button
+              type="button"
+              className="accent-button"
+              onClick={() => openSongPicker(playlistId)}
+            >
+              <Icon n="plus" s={16} /> Add songs to playlist
+            </button>
+          )}
+        </div>
       ) : (
         <div style={{ height: list.length * ROW }} className="relative">
           {positions.map((p) => {
@@ -610,19 +621,38 @@ export default function Library({
           <button type="button" className="outline-button" disabled={!list.length} onClick={() => enqueueMany(list)}>
             <Icon n="list-music" s={16} /> Add to queue
           </button>
-          {group.playlistId && (
-            <button type="button" className="accent-button" onClick={() => openSongPicker(group.playlistId!)}>
-              <Icon n="plus" s={16} /> Add songs
+          {group.playlistId ? (
+            <>
+              <button
+                type="button"
+                className="accent-button"
+                aria-label="Add songs to playlist"
+                onClick={() => openSongPicker(group.playlistId!)}
+              >
+                <Icon n="plus" s={16} /> Add songs
+              </button>
+              {list.length > 0 && (
+                <button
+                  type="button"
+                  className="outline-button"
+                  aria-label="Copy songs to another playlist"
+                  onClick={() => openPlaylistPicker(list.map((i) => tracks[i]?.id).filter((id): id is string => !!id))}
+                >
+                  <Icon n="plus" s={16} /> Copy to another playlist
+                </button>
+              )}
+            </>
+          ) : (
+            <button
+              type="button"
+              className="outline-button"
+              disabled={!list.length}
+              aria-label="Add to playlist"
+              onClick={() => openPlaylistPicker(list.map((i) => tracks[i]?.id).filter((id): id is string => !!id))}
+            >
+              <Icon n="plus" s={16} /> Add to playlist
             </button>
           )}
-          <button
-            type="button"
-            className="outline-button"
-            disabled={!list.length}
-            onClick={() => openPlaylistPicker(list.map((i) => tracks[i]?.id).filter((id): id is string => !!id))}
-          >
-            <Icon n="plus" s={16} /> {group.playlistId ? "Copy to playlist" : "Add to playlist"}
-          </button>
           {group.playlistId && (
             <>
               <button

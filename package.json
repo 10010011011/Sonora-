@@ -1,7 +1,7 @@
 {
   "name": "sonora-player",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.2.1",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "lint": "tsc --noEmit",
     "test:lyrics": "tsx test-lyrics.ts",
-    "test:core": "tsx --test lyrics-and-dsp.test.ts section2.test.ts playlist-and-sheets.test.ts",
+    "test:core": "tsx --test lyrics-and-dsp.test.ts section2.test.ts playlist-and-sheets.test.ts engine-guards.test.ts",
     "test:native": "node run-native-helper-tests.mjs"
   },
   "dependencies": {
