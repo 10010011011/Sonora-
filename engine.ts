@@ -4,8 +4,9 @@ import { diag, diagTick } from "./diag";
 import { getTrackAudioConfig } from "./userdata";
 
 const dB = (x: number) => Math.pow(10, x / 20);
-const MAX_ANALYZE_BYTES = 45 * 1024 * 1024; // Skip full decode analysis for files > 45 MB
-const MAX_ANALYZE_SECONDS = 10 * 60; // ...and for tracks longer than 10 minutes (decoded PCM is ~100 MB per 10 min)
+const MAX_ANALYZE_BYTES = 24 * 1024 * 1024; // Skip full decode analysis for files > 24 MB
+const MAX_ANALYZE_SECONDS = 6 * 60; // ...and for tracks longer than 6 minutes (decoded PCM is ~30 MB per minute of stereo audio)
+const MAX_FAIL_STREAK = 3; // consecutive unplayable songs before auto-skip gives up
 /** Formats whose frames resync mid-stream, so a leading byte range still decodes (used for the ReplayGain pass). */
 const WINDOWABLE = /\.(mp3|ogg|oga|opus|aac)$/i;
 
@@ -269,6 +270,9 @@ class Engine {
   private boost!: GainNode;
   private limiter!: DynamicsCompressorNode;
   private limiterOn: boolean | null = null;
+  /** Songs that already had their one silent retry (by load id), and consecutive failures since the last good play. */
+  private retried = new Set<number>();
+  private failStreak = 0;
   private volume!: GainNode;
   private sleepGain!: GainNode;
 
@@ -342,6 +346,7 @@ class Engine {
       });
       el.addEventListener("timeupdate", () => i === this.active && this.checkSleep());
       el.addEventListener("playing", () => {
+        if (i === this.active) this.failStreak = 0;
         if (i !== this.active || !this.switchMarkAt) return;
         diag("switch-latency", { ms: Math.round(performance.now() - this.switchMarkAt), hidden: document.hidden });
         this.switchMarkAt = 0;
@@ -375,9 +380,33 @@ class Engine {
           diag("media-abort-ignored", details);
           return;
         }
+        // A transient failure (file busy, storage hiccup, interrupted read) deserves one quiet second try
+        // before the song is given up on and skipped.
+        if (!this.retried.has(loadId)) {
+          if (this.retried.size > 50) this.retried.clear();
+          this.retried.add(loadId);
+          const wasPlaying = player.get().playing;
+          const at = el.currentTime || 0;
+          diag("media-error-retry", details);
+          window.setTimeout(() => {
+            if (i !== this.active || this.slotLoadId[i] !== loadId || this.slotPos[i] !== pos) return;
+            el.addEventListener(
+              "loadedmetadata",
+              () => {
+                if (at > 0) el.currentTime = at;
+                if (wasPlaying) void el.play().catch(() => {});
+              },
+              { once: true },
+            );
+            el.load();
+          }, 250);
+          return;
+        }
+        const label = track?.title || track?.fileName || "this song";
+        const ext = (track?.fileName.split(".").pop() || "").toUpperCase();
         toast(mediaError?.code === 4
-          ? "This audio format or file location isn't supported"
-          : "Could not read this audio file");
+          ? `Can't play “${label}”${ext ? ` (${ext})` : ""}: format or file location not supported`
+          : `Could not read “${label}”`);
         window.setTimeout(() => {
           if (
             i !== this.active ||
@@ -386,6 +415,14 @@ class Engine {
             (el.currentSrc || el.src) !== source ||
             !el.error
           ) return;
+          // Never chain through a whole library of unplayable files: after a few misses in a row, stop.
+          if (++this.failStreak >= MAX_FAIL_STREAK) {
+            this.failStreak = 0;
+            diag("media-error-stop", details);
+            toast("Several songs in a row failed to play, so playback stopped");
+            this.pause(true);
+            return;
+          }
           diag("media-error-advance", { ...details, hidden: document.hidden });
           void this.next();
         }, 400);
@@ -595,6 +632,8 @@ class Engine {
     if (!ctx) return;
     const t = ctx.currentTime;
     const set = (p: AudioParam, v: number) => (force ? (p.value = v) : p.setTargetAtTime(v, t, 0.025));
+    // ReplayGain can change while a song plays (analysis finishes late). A slow ramp keeps that from being a jump.
+    const setSlow = (p: AudioParam, v: number) => (force ? (p.value = v) : p.setTargetAtTime(v, t, 0.5));
 
     const eqv = s.eqOn ? s.eq : s.eq.map(() => 0);
     const maxBoost = s.eqOn ? Math.max(0, ...s.eq, s.bassDb, s.trebleDb) : 0;
@@ -682,12 +721,22 @@ class Engine {
     set(this.roomDry.gain, 1 - s.room * 0.3);
 
     set(this.boost.gain, dB(s.boostDb));
-    if (s.limiter !== this.limiterOn) {
+    // The limiter only earns its place when something can push peaks past full scale. With flat EQ, no boost and
+    // ReplayGain attenuating, the signal is the file itself, and a compressor in the path would only colour loud masters.
+    const rgUp = Math.max(0, ...this.els.map((_, i) => {
+      const pos = this.slotPos[i];
+      const tr = pos != null ? this.trackAt(pos) : undefined;
+      return tr ? this.rgFor(tr) : 0;
+    }));
+    const netGainDb = s.boostDb + (s.preampDb - (s.autoPreamp ? maxBoost : 0)) + maxBoost + rgUp;
+    const widens = wantSpatial && s.width > 1.005;
+    const wantLimiter = s.limiter && (netGainDb > 0.05 || widens || s.orbit || s.room > 0.01);
+    if (wantLimiter !== this.limiterOn) {
       try {
         this.boost.disconnect();
       } catch {}
-      this.boost.connect(s.limiter ? this.limiter : this.volume);
-      this.limiterOn = s.limiter;
+      this.boost.connect(wantLimiter ? this.limiter : this.volume);
+      this.limiterOn = wantLimiter;
     }
     const vol = s.muted ? 0 : s.volume * s.volume * this.duckFactor;
     set(this.volume.gain, vol);
@@ -695,7 +744,7 @@ class Engine {
     this.els.forEach((_, i) => {
       const pos = this.slotPos[i];
       const tr = pos != null ? this.trackAt(pos) : undefined;
-      if (tr) set(this.rg[i].gain, dB(this.rgFor(tr)));
+      if (tr) setSlow(this.rg[i].gain, dB(this.rgFor(tr)));
     });
   }
 
@@ -762,7 +811,7 @@ class Engine {
   }
 
   /**
-   * Decodes and analyses a track. Bounded: tracks over 10 minutes or 45 MB are refused, except that the
+   * Decodes and analyses a track. Bounded: tracks over 6 minutes or 24 MB are refused, except that the
    * ReplayGain pass (`loudnessOnly`) may analyse the first part of a frame-resyncable file (mp3/ogg/opus/aac).
    * Only called on demand (Visual page, ReplayGain on first play), never when a library loads.
    */
@@ -781,7 +830,7 @@ class Engine {
     let range: string | undefined;
     if (tooLong || tooBig) {
       if (!opts.loudnessOnly || !WINDOWABLE.test(t.fileName)) {
-        throw new Error(tooLong ? "Track is longer than 10 minutes — analysis skipped" : "File too large for full decode analysis");
+        throw new Error(tooLong ? "Track is longer than 6 minutes — analysis skipped" : "File too large for full decode analysis");
       }
       const share = tooLong ? MAX_ANALYZE_SECONDS / (t.duration as number) : 1;
       const bytes = Math.max(1, Math.min(MAX_ANALYZE_BYTES, Math.ceil(t.size * share)));
@@ -1200,7 +1249,7 @@ class Engine {
     this.checkSleep();
 
     if (this.ctx) {
-      const red = s.limiter ? this.limiter.reduction : 0;
+      const red = this.limiterOn ? this.limiter.reduction : 0;
       let clip = false;
       if (!s.limiter && s.boostDb > 0) {
         if (!this.tdBuf) this.tdBuf = new Float32Array(this.analyser.fftSize);

@@ -9,14 +9,15 @@ if (!file || !fs.existsSync(file)) {
 }
 let xml = fs.readFileSync(file, "utf8");
 
-// Permissions we no longer want.
-const REMOVE = ["READ_MEDIA_AUDIO", "READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE", "MODIFY_AUDIO_SETTINGS", "BLUETOOTH_CONNECT"];
+// Permissions we do not want (library access goes through the system file picker; the mic is never used).
+const REMOVE = ["READ_MEDIA_AUDIO", "READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE", "MODIFY_AUDIO_SETTINGS", "RECORD_AUDIO"];
 for (const p of REMOVE) {
   xml = xml.replace(new RegExp('[ \\t]*<uses-permission[^>]*android\\.permission\\.' + p + '"[^>]*/>\\s*\\n?', "g"), "");
 }
 
-// Permissions the media service needs.
-const ADD = ["FOREGROUND_SERVICE", "FOREGROUND_SERVICE_MEDIA_PLAYBACK", "POST_NOTIFICATIONS", "WAKE_LOCK"];
+// Permissions the media service needs. BLUETOOTH_CONNECT is "Nearby devices" on Android 12+: it must be declared here or
+// Android has nothing to ask for (App info > Permissions stays empty) and Bluetooth headset names are withheld.
+const ADD = ["FOREGROUND_SERVICE", "FOREGROUND_SERVICE_MEDIA_PLAYBACK", "POST_NOTIFICATIONS", "WAKE_LOCK", "BLUETOOTH_CONNECT"];
 const missing = ADD.filter((p) => !xml.includes("android.permission." + p + '"'));
 if (missing.length) {
   const lines = missing.map((p) => '    <uses-permission android:name="android.permission.' + p + '" />').join("\n");

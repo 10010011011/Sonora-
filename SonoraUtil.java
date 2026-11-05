@@ -47,6 +47,15 @@ final class SonoraUtil {
         }
     }
 
+    /** BitmapFactory inSampleSize (a power of two) so the longest side of the decoded image is at most {@code maxPx}. */
+    static int sampleSizeFor(int width, int height, int maxPx) {
+        int longest = Math.max(width, height);
+        if (longest <= 0 || maxPx <= 0) return 1;
+        int sample = 1;
+        while (longest / (sample * 2) >= maxPx) sample *= 2;
+        return sample;
+    }
+
     /** Directory part of a "a/b/c.mp3" style path; empty when the file sits at the root. */
     static String parentDir(String path) {
         if (path == null) return "";

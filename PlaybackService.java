@@ -58,6 +58,13 @@ public class PlaybackService extends Service {
     static final String ACTION_PREV = "app.sonora.player.PREV";
     static final String ACTION_STOP = "app.sonora.player.STOP";
     private static final long WAKE_TIMEOUT_MS = 10L * 60 * 60 * 1000;
+    /**
+     * A paused session stays a foreground service for this long, so Android keeps the process (and the WebView
+     * that owns playback) alive and the notification buttons keep working. After it, the notification is removed
+     * instead of being left behind as a "zombie" whose buttons do nothing.
+     */
+    private static final long IDLE_STOP_MS = 30L * 60 * 1000;
+    private static final int COVER_MAX_PX = 512;
 
     private static volatile PlaybackService instance;
     private static volatile Snapshot latest = new Snapshot();
@@ -70,7 +77,7 @@ public class PlaybackService extends Service {
     static void apply(Context context, Snapshot snapshot) {
         latest = snapshot;
         PlaybackService svc = instance;
-        if (svc != null) {
+        if (svc != null && !svc.stopping) {
             svc.main.post(svc::refresh);
         } else if (snapshot.playing) {
             try {
@@ -85,8 +92,10 @@ public class PlaybackService extends Service {
     private final Handler main = new Handler(Looper.getMainLooper());
     private MediaSessionCompat session;
     private PowerManager.WakeLock wakeLock;
-    private boolean inForeground;
     private boolean everForeground;
+    /** Set once the session is being torn down, so a late refresh cannot bring the notification back. */
+    private volatile boolean stopping;
+    private final Runnable idleStop = () -> { if (!latest.playing) stopAndRemove(); };
     private Bitmap cover;
     private String coverName = "";
 
@@ -134,35 +143,49 @@ public class PlaybackService extends Service {
 
     @Override
     public void onTaskRemoved(Intent rootIntent) {
-        // Swiping the app away while paused ends the session; while playing, music keeps going.
-        if (!latest.playing) stopAndRemove();
+        // Swiping the app away destroys the WebView, which is what actually plays the audio. Whatever the state, the
+        // notification would be left with controls that reach nothing, so end the session cleanly.
+        stopAndRemove();
         super.onTaskRemoved(rootIntent);
     }
 
     @Override
     public void onDestroy() {
-        instance = null;
+        if (instance == this) instance = null;
         releaseWake();
         if (session != null) { session.setActive(false); session.release(); }
         super.onDestroy();
     }
 
+    /**
+     * Relays a transport command to JS. When JS is gone (WebView destroyed, process restarted) the notification is
+     * stale and its buttons can no longer work, so it is removed instead of lingering. Commands are never queued:
+     * a retained "next" replayed minutes later, when the app is reopened, looks like a random skip.
+     */
     private void command(String action, long positionMs) {
         JSObject event = new JSObject().put("action", action);
         if (positionMs >= 0 || "seekBy".equals(action)) event.put("positionMs", positionMs);
-        SonoraPlayerPlugin.emit("mediaCommand", event);
+        if (!SonoraPlayerPlugin.emit("mediaCommand", event, false) && !"stop".equals(action)) stopAndRemove();
     }
 
     private void stopAndRemove() {
+        stopping = true;
+        main.removeCallbacks(idleStop);
         releaseWake();
         AudioFocusController.get(this).onPlaybackStopped();
         latest = new Snapshot();
-        stopForeground(STOP_FOREGROUND_REMOVE);
-        inForeground = false;
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE);
+        } catch (RuntimeException ignored) { }
+        try {
+            ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).cancel(NOTIFICATION_ID);
+        } catch (RuntimeException ignored) { }
+        everForeground = false;
         stopSelf();
     }
 
     void refresh() {
+        if (stopping) return;
         Snapshot s = latest;
         loadCover(s.coverName);
 
@@ -187,27 +210,25 @@ public class PlaybackService extends Service {
             .build());
 
         Notification n = buildNotification(s);
-        // The first command after startForegroundService() must always call startForeground().
-        if (s.playing || !everForeground) {
-            try {
-                ServiceCompat.startForeground(this, NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
-                inForeground = true;
-                everForeground = true;
-            } catch (RuntimeException e) {
-                SonoraPlayerPlugin.emit("serviceError", new JSObject().put("message", String.valueOf(e.getMessage())));
+        // Stay a foreground service while paused too (bounded by IDLE_STOP_MS): a detached notification outlives the
+        // process Android is free to kill, and its buttons then reach nothing.
+        try {
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+            everForeground = true;
+        } catch (RuntimeException e) {
+            SonoraPlayerPlugin.emit("serviceError", new JSObject().put("message", String.valueOf(e.getMessage())));
+            if (everForeground) {
+                try {
+                    ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).notify(NOTIFICATION_ID, n);
+                } catch (RuntimeException ignored) { }
             }
         }
+        main.removeCallbacks(idleStop);
         if (s.playing) {
             acquireWake();
         } else {
             releaseWake();
-            if (inForeground) {
-                stopForeground(STOP_FOREGROUND_DETACH); // keep the notification, but let the user swipe it away
-                inForeground = false;
-            }
-            try {
-                ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).notify(NOTIFICATION_ID, n);
-            } catch (SecurityException ignored) { }
+            main.postDelayed(idleStop, IDLE_STOP_MS);
         }
     }
 
@@ -230,6 +251,7 @@ public class PlaybackService extends Service {
             .addAction(s.playing ? R.drawable.ic_sonora_pause : R.drawable.ic_sonora_play,
                 s.playing ? "Pause" : "Play", servicePending(s.playing ? ACTION_PAUSE : ACTION_PLAY, 2))
             .addAction(R.drawable.ic_sonora_next, "Next", servicePending(ACTION_NEXT, 3))
+            .addAction(R.drawable.ic_sonora_close, "Close", servicePending(ACTION_STOP, 5))
             .setStyle(new androidx.media.app.NotificationCompat.MediaStyle()
                 .setMediaSession(session.getSessionToken())
                 .setShowActionsInCompactView(0, 1, 2));
@@ -248,7 +270,18 @@ public class PlaybackService extends Service {
         cover = null;
         if (name.isEmpty()) return;
         File f = LibraryStore.get(this).coverFile(name);
-        if (f != null && f.isFile()) cover = BitmapFactory.decodeFile(f.getAbsolutePath());
+        if (f == null || !f.isFile()) return;
+        try {
+            // Decode at notification size, not full size: a 3000 px cover is ~36 MB of bitmap otherwise.
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(f.getAbsolutePath(), bounds);
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inSampleSize = SonoraUtil.sampleSizeFor(bounds.outWidth, bounds.outHeight, COVER_MAX_PX);
+            cover = BitmapFactory.decodeFile(f.getAbsolutePath(), opts);
+        } catch (RuntimeException | OutOfMemoryError e) {
+            cover = null;
+        }
     }
 
     private void acquireWake() {

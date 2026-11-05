@@ -117,9 +117,13 @@ interface SonoraPlayerPlugin {
   saveState(o: { json: string }): Promise<void>;
   loadState(): Promise<{ json: string | null }>;
   updateSession(o: SessionUpdate): Promise<void>;
-  getAudioOutputs(): Promise<{ outs: AudioOutputDevice[]; supported: boolean }>;
+  getAudioOutputs(): Promise<{ outs: AudioOutputDevice[]; supported: boolean; namesHidden?: boolean }>;
+  /** Android 12+ "Nearby devices": unlocks real Bluetooth headset names. */
+  requestHeadsetPermission(): Promise<{ granted: boolean; blocked: boolean }>;
+  openAppSettings(): Promise<void>;
+  openNotificationSettings(): Promise<void>;
   requestFocus(): Promise<{ granted: boolean }>;
-  requestNotificationPermission(): Promise<{ granted: boolean }>;
+  requestNotificationPermission(): Promise<{ granted: boolean; blocked?: boolean }>;
   setBackHandled(o: { enabled: boolean }): Promise<void>;
   moveToBackground(): Promise<void>;
   setAppIcon(o: { name: string }): Promise<void>;

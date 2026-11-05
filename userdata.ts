@@ -87,29 +87,60 @@ export function normalizeUserData(raw: unknown): UserData {
 
 let started = false;
 let saveTimer: number | undefined;
+let retryTimer: number | undefined;
+
+/** Playlist and bookmark edits are saved almost at once; resume positions tick along and can wait. */
+const SAVE_SOON_MS = 400;
+const SAVE_RESUME_MS = 8000;
+const SAVE_RETRY_MS = 5000;
 
 /** Loads the native copy (Android) and mirrors every later change back to it. Call before restoring the queue. */
 export async function initUserData() {
   if (started) return;
   started = true;
-  if (isNative()) {
-    try {
-      const { json } = await SonoraPlayer.loadUserData();
-      if (json) userdata.set(normalizeUserData(JSON.parse(json)));
-    } catch {
-      // keep whatever localStorage had
+  if (!isNative()) return;
+  // Anything changed before the native copy arrives is kept and merged, never overwritten by the older file.
+  let editedBeforeLoad = false;
+  const markEdited = userdata.sub(() => { editedBeforeLoad = true; });
+  try {
+    const { json } = await SonoraPlayer.loadUserData();
+    if (json) {
+      const fromDisk = normalizeUserData(JSON.parse(json));
+      userdata.set(editedBeforeLoad ? mergeUserData(userdata.get(), fromDisk) : fromDisk);
     }
-    userdata.sub(() => {
-      window.clearTimeout(saveTimer);
-      saveTimer = window.setTimeout(flushUserData, 1000);
-    });
+  } catch {
+    // keep whatever localStorage had
   }
+  markEdited();
+  let prev = userdata.get();
+  userdata.sub(() => {
+    const next = userdata.get();
+    const onlyResume =
+      next.playlists === prev.playlists &&
+      next.bookmarks === prev.bookmarks &&
+      next.trackConfigs === prev.trackConfigs &&
+      next.libraryOrder === prev.libraryOrder;
+    prev = next;
+    // A pending quick save must not be pushed back by a later resume tick.
+    if (onlyResume && saveTimer !== undefined) return;
+    window.clearTimeout(saveTimer);
+    saveTimer = window.setTimeout(flushUserData, onlyResume ? SAVE_RESUME_MS : SAVE_SOON_MS);
+  });
+  if (editedBeforeLoad) flushUserData();
 }
 
 export function flushUserData() {
   window.clearTimeout(saveTimer);
+  saveTimer = undefined;
   if (!isNative()) return;
-  void SonoraPlayer.saveUserData({ json: JSON.stringify(userdata.get()) }).catch(() => {});
+  void SonoraPlayer.saveUserData({ json: JSON.stringify(userdata.get()) }).then(
+    () => window.clearTimeout(retryTimer),
+    () => {
+      // The write failed (storage busy or full). Try again rather than silently losing playlists.
+      window.clearTimeout(retryTimer);
+      retryTimer = window.setTimeout(flushUserData, SAVE_RETRY_MS);
+    },
+  );
 }
 
 /* ---------------- playlists & M3U export/import ---------------- */

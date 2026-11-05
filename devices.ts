@@ -8,10 +8,12 @@ export interface OutDev {
   key: string;
 }
 
-export const devices = createStore<{ outs: OutDev[]; supported: boolean; named: boolean }>({
+export const devices = createStore<{ outs: OutDev[]; supported: boolean; named: boolean; namesHidden: boolean }>({
   outs: [],
   supported: false,
   named: false,
+  /** Android 12+ is withholding Bluetooth names until the "Nearby devices" permission is granted. */
+  namesHidden: false,
 });
 
 const HEADSET = /head|ear|bud|airpod|bluetooth|bt|wh-|wf-|galaxy buds|pods|jbl|sony|bose|usb/i;
@@ -19,18 +21,20 @@ let pausedByDisconnect = false;
 let prevKeys = new Set<string>();
 
 const keyFor = (d: MediaDeviceInfo) =>
-  (d.label ? d.label.replace(/\\s*\\(.*?\\)\\s*$/, "").trim() : d.deviceId.slice(0, 12)) || "default";
+  (d.label ? d.label.replace(/\s*\(.*?\)\s*$/, "").trim() : d.deviceId.slice(0, 12)) || "default";
 
-function publishScan(outs: OutDev[], initial: boolean, supported = true) {
+function publishScan(outs: OutDev[], initial: boolean, supported = true, namesHidden = false) {
   const named = outs.some((o) => o.label && o.label !== "Audio output device" && o.label !== "System default output");
-  devices.set({ outs, supported, named });
+  devices.set({ outs, supported, named, namesHidden });
 
   const keys = new Set(outs.map((o) => o.key));
   if (!initial) {
     const added = outs.filter((o) => !prevKeys.has(o.key));
     const removed = [...prevKeys].filter((k) => !keys.has(k));
     const s = settings.get();
-    if (removed.length && player.get().playing && s.pauseOnDisconnect) {
+    // On Android the platform's own "becoming noisy" broadcast pauses (handleBecomingNoisy). A device list that merely
+    // changes (a second device appears, a name refreshes after the permission is granted) must never pause music.
+    if (!isNative() && removed.length && player.get().playing && s.pauseOnDisconnect) {
       pausedByDisconnect = true;
       engine.pause();
       toast(`${removed[0]} disconnected — paused`);
@@ -65,7 +69,7 @@ async function scan(initial = false) {
   try {
     if (isNative()) {
       const result = await SonoraPlayer.getAudioOutputs();
-      publishScan(result.outs, initial, result.supported);
+      publishScan(result.outs, initial, result.supported, !!result.namesHidden);
       return;
     }
     if (typeof navigator === "undefined") return;
@@ -82,7 +86,7 @@ async function scan(initial = false) {
     }));
     publishScan(outs, initial);
   } catch {
-    if (isNative()) devices.set({ outs: [], supported: true, named: false });
+    if (isNative()) devices.set({ outs: [], supported: true, named: false, namesHidden: false });
   }
 }
 
@@ -107,11 +111,27 @@ export function handleBecomingNoisy() {
   toast("Audio output disconnected — paused");
 }
 
-/** On Android, output names come from AudioManager and do not require microphone access. */
+/**
+ * Android: asks for "Nearby devices" (the permission that lets Android reveal Bluetooth headset names) and rescans.
+ * Never needs the microphone. If Android will not show the prompt any more, opens App info instead.
+ * Web: names are unlocked through getUserMedia.
+ */
 export async function requestDeviceNames() {
   if (isNative()) {
-    await scan(true);
-    toast(devices.get().named ? "Headset names refreshed" : "No named headset is connected");
+    try {
+      const res = await SonoraPlayer.requestHeadsetPermission();
+      await scan(true);
+      if (res.granted) {
+        toast(devices.get().named ? "Headset names refreshed" : "Allowed. No named headset is connected right now");
+      } else if (res.blocked) {
+        toast("Turn on “Nearby devices” in App info → Permissions");
+        await SonoraPlayer.openAppSettings().catch(() => {});
+      } else {
+        toast("Headset names stay generic until Nearby devices is allowed");
+      }
+    } catch {
+      toast("Could not check the headset permission");
+    }
     return;
   }
   try {

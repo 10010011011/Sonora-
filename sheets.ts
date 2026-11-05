@@ -8,16 +8,19 @@ export interface SheetState {
   tags: string | null;
   /** "Add to playlist" picker for these track ids. */
   picker: string[] | null;
+  /** "Add songs" picker for one playlist (by playlist id): pick any library songs to put into it. */
+  songPicker: string | null;
   queue: boolean;
   bookmarks: boolean;
 }
 
-const closed: SheetState = { menu: null, tags: null, picker: null, queue: false, bookmarks: false };
+const closed: SheetState = { menu: null, tags: null, picker: null, songPicker: null, queue: false, bookmarks: false };
 export const sheets = createStore<SheetState>(closed);
 
 export const openTrackMenu = (idx: number, playlistId?: string) => sheets.set({ menu: { idx, playlistId } });
 export const openTagEditor = (id: string) => sheets.set({ ...closed, tags: id });
 export const openPlaylistPicker = (ids: string[]) => sheets.set({ ...closed, picker: ids });
+export const openSongPicker = (playlistId: string) => sheets.set({ ...closed, songPicker: playlistId });
 export const openQueue = () => sheets.set({ ...closed, queue: true });
 export const openBookmarks = () => sheets.set({ ...closed, bookmarks: true });
 export const closeSheets = () => sheets.set(closed);

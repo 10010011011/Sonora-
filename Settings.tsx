@@ -2,9 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { Capacitor } from "@capacitor/core";
 import { useStore, settings, player, toast, type ThemeName } from "./store";
 import { devices, requestDeviceNames } from "./devices";
+import { requestNotificationAccess } from "./nativeBridge";
 import { Icon } from "./ui";
 import { Calibrate } from "./SharedAudioViews";
-import { getLibraryStats, SonoraPlayer } from "./nativeLibrary";
+import { getLibraryStats } from "./nativeLibrary";
 import { diagReport } from "./diag";
 import { useBackHandler } from "./useBack";
 import { useFocusTrap } from "./focusTrap";
@@ -47,18 +48,6 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     if (Capacitor.isNativePlatform()) getLibraryStats().then(setStats).catch(() => {});
   }, []);
-
-  const requestNotificationAccess = async () => {
-    try {
-      const { granted } = await SonoraPlayer.requestNotificationPermission();
-      localStorage.setItem("sonora.notifAsked", granted ? "granted" : "denied");
-      toast(granted
-        ? "Notification access is enabled"
-        : "Notification access is blocked. Check Android app notification settings.");
-    } catch {
-      toast("Could not check notification access");
-    }
-  };
 
   const copyDiagnostics = async () => {
     try {
@@ -435,9 +424,9 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
               <div className="setting-line">
                 <div>
                   <b>Notification access</b>
-                  <span>Retry Android's notification permission request. Media controls also depend on the active playback session.</span>
+                  <span>Needed for the lock-screen and notification controls (play, pause, skip). Opens Android settings if the prompt was dismissed for good.</span>
                 </div>
-                <button type="button" className="outline-button h-8 px-3 text-xs" onClick={requestNotificationAccess}>
+                <button type="button" className="outline-button h-8 px-3 text-xs" onClick={() => void requestNotificationAccess(true)}>
                   Check access
                 </button>
               </div>
@@ -448,12 +437,12 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                   <b>Headset device names</b>
                   <span>
                     {Capacitor.isNativePlatform()
-                      ? "Reads connected Bluetooth / USB output names directly from Android. No microphone permission is needed."
+                      ? "Shows your headset's real name (and applies its EQ profile). Asks for Android's “Nearby devices” permission. The microphone is never used."
                       : "Unlock Bluetooth / USB headset names for automatic EQ profile switching"}
                   </span>
                 </div>
                 <button type="button" className="outline-button h-8 px-3 text-xs" onClick={requestDeviceNames}>
-                  {Capacitor.isNativePlatform() ? "Refresh" : "Unlock names"}
+                  {Capacitor.isNativePlatform() ? "Allow" : "Unlock names"}
                 </button>
               </div>
             )}

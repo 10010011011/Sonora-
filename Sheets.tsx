@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { useStore, library, player, settings, toast, toggleLikeTrack, fmt } from "./store";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useStore, library, player, settings, toast, toggleLikeTrack, fmt, type Track } from "./store";
 import { engine } from "./engine";
 import { useBackHandler } from "./useBack";
 import { useFocusTrap } from "./focusTrap";
@@ -57,6 +57,7 @@ export function SheetsHost() {
       {s.menu && <TrackMenu idx={s.menu.idx} playlistId={s.menu.playlistId} />}
       {s.tags && <TagEditor id={s.tags} />}
       {s.picker && <PlaylistPicker ids={s.picker} />}
+      {s.songPicker && <SongPicker playlistId={s.songPicker} />}
       {s.queue && <QueueSheet />}
       {s.bookmarks && <BookmarksSheet />}
       {imp.phase !== "idle" && <ImportSheet />}
@@ -257,6 +258,107 @@ function PlaylistPicker({ ids }: { ids: string[] }) {
           <Icon n="list-music" s={18} /> {p.name} <small>{p.trackIds.length}</small>
         </button>
       ))}
+    </Sheet>
+  );
+}
+
+/**
+ * "Add songs" for a playlist: search the library, tick songs, add them all in one go.
+ * Works on an empty, brand-new playlist (the old toolbar button only copied a playlist's own songs elsewhere).
+ */
+const SONG_PICK_LIMIT = 150;
+
+function SongPicker({ playlistId }: { playlistId: string }) {
+  const tracks = useStore(library, (l) => l.tracks);
+  const playlist = useStore(userdata, (u) => u.playlists.find((p) => p.id === playlistId));
+  const [q, setQ] = useState("");
+  const [picked, setPicked] = useState<string[]>([]);
+  const have = useMemo(() => new Set(playlist?.trackIds ?? []), [playlist]);
+  const pickedSet = useMemo(() => new Set(picked), [picked]);
+
+  const matches = useMemo(() => {
+    const words = q.toLowerCase().split(/\s+/).filter(Boolean);
+    const out: Track[] = [];
+    for (const t of tracks) {
+      if (words.length) {
+        const hay = `${t.title} ${t.artist} ${t.album} ${t.fileName}`.toLowerCase();
+        if (!words.every((w) => hay.includes(w))) continue;
+      }
+      out.push(t);
+    }
+    return out;
+  }, [tracks, q]);
+
+  if (!playlist) return null;
+  const shown = matches.slice(0, SONG_PICK_LIMIT);
+  const addable = matches.filter((t) => !have.has(t.id));
+  const toggle = (id: string) => setPicked((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]));
+  const done = () => {
+    const n = picked.length ? addToPlaylist(playlistId, picked) : 0;
+    if (n) toast(`Added ${n} song${n === 1 ? "" : "s"} to “${playlist.name}”`);
+    closeSheets();
+  };
+
+  return (
+    <Sheet title={`Add songs to ${playlist.name}`} onClose={closeSheets}>
+      {tracks.length === 0 ? (
+        <p className="sheet-note">Your library is empty. Import songs first, then add them here.</p>
+      ) : (
+        <>
+          <div className="field-row">
+            <input
+              className="field-input"
+              placeholder="Search your songs"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              aria-label="Search songs to add"
+              type="search"
+            />
+          </div>
+          <div className="field-row">
+            <button
+              type="button"
+              className="outline-button"
+              disabled={!addable.length}
+              onClick={() => setPicked((cur) => [...new Set([...cur, ...addable.map((t) => t.id)])])}
+            >
+              Select all{q.trim() ? " results" : ""} ({addable.length})
+            </button>
+            <button type="button" className="outline-button" disabled={!picked.length} onClick={() => setPicked([])}>
+              Clear
+            </button>
+          </div>
+          {matches.length === 0 && <p className="sheet-note">No songs match “{q.trim()}”.</p>}
+          {shown.map((t) => {
+            const inList = have.has(t.id);
+            const on = pickedSet.has(t.id);
+            return (
+              <button
+                key={t.id}
+                type="button"
+                className="sheet-row"
+                disabled={inList}
+                aria-pressed={on}
+                onClick={() => toggle(t.id)}
+                style={inList ? { opacity: 0.55 } : undefined}
+              >
+                <Icon n={inList || on ? "check" : "plus"} s={18} />
+                <span className="queue-name">
+                  <b>{t.title}</b>
+                  <small style={{ marginLeft: 0 }}>{[t.artist, t.album].filter(Boolean).join(" · ")}</small>
+                </span>
+                {inList && <small>In playlist</small>}
+              </button>
+            );
+          })}
+          {matches.length > shown.length && (
+            <p className="sheet-note">Showing the first {SONG_PICK_LIMIT} of {matches.length}. Search to narrow the list.</p>
+          )}
+        </>
+      )}
+      <button type="button" className="accent-button sheet-primary" onClick={done}>
+        {picked.length ? `Add ${picked.length} song${picked.length === 1 ? "" : "s"}` : "Done"}
+      </button>
     </Sheet>
   );
 }

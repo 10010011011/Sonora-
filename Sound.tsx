@@ -4,6 +4,7 @@ import { engine } from "./engine";
 import { useCurrent } from "./Player";
 import { devices, saveProfile, applyProfile, requestDeviceNames } from "./devices";
 import { userdata, saveTrackAudioConfig } from "./userdata";
+import { isNative } from "./nativeLibrary";
 import { Slider, Toggle, Chip, Icon } from "./ui";
 
 const SIMPLE_PRESETS: { name: string; bass: number; mids: number; treble: number; eq: number[] }[] = [
@@ -97,7 +98,13 @@ export default function Sound({ onOpenVisual }: { onOpenVisual: () => void }) {
   const trackConfigs = useStore(userdata, (u) => u.trackConfigs);
   const outs = useStore(devices, (d) => d.outs);
   const named = useStore(devices, (d) => d.named);
-  const outputId = useStore(player, (p) => p.outputId);
+  const namesHidden = useStore(devices, (d) => d.namesHidden);
+  const playerOutputId = useStore(player, (p) => p.outputId);
+  // On Android the system decides where audio goes (the web audio context cannot pick a device), so the selector
+  // only chooses which connected output a saved profile is bound to.
+  const native = isNative();
+  const [bindId, setBindId] = useState("");
+  const outputId = native ? bindId || "default" : playerOutputId;
   const rgApplied = useStore(player, (p) => p.rgApplied);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [autoEqOpen, setAutoEqOpen] = useState(false);
@@ -573,12 +580,16 @@ export default function Sound({ onOpenVisual }: { onOpenVisual: () => void }) {
             value={outputId}
             onChange={(e) => {
               const id = e.target.value;
-              engine.setOutput(id);
-              toast("Audio output switched");
+              if (native) {
+                setBindId(id === "default" ? "" : id);
+                toast(id === "default" ? "Profile will not be bound to a device" : "Profile will bind to this output");
+                return;
+              }
+              void engine.setOutput(id).then((ok) => toast(ok ? "Audio output switched" : "This browser cannot switch outputs"));
             }}
-            aria-label="Audio output"
+            aria-label={native ? "Output to bind the profile to" : "Audio output"}
           >
-            <option value="default">System default output</option>
+            <option value="default">{native ? "No device (apply manually)" : "System default output"}</option>
             {outs
               .filter((d) => d.id && d.id !== "default")
               .map((d, i) => (
@@ -640,10 +651,13 @@ export default function Sound({ onOpenVisual }: { onOpenVisual: () => void }) {
           </div>
         )}
 
-        {!named && (
+        {native && (
+          <p className="mt-2 text-xs text-muted">Android plays through your connected headset or speaker automatically.</p>
+        )}
+        {(native ? namesHidden : !named) && (
           <div className="mt-3">
             <button type="button" className="outline-button text-xs" onClick={requestDeviceNames}>
-              Unlock device names (requests audio permission once)
+              {native ? "Show real headset names (allow Nearby devices)" : "Unlock device names (requests audio permission once)"}
             </button>
           </div>
         )}

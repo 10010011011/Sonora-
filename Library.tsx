@@ -4,7 +4,7 @@ import { useStore, library, player, settings, lyricsStore, fmt, toggleLikeTrack,
 import { IN_PLACE_FOLDERS, addAudioFiles, importFolderFromDevice, openFolderHandle, savedFolder } from "./library";
 import { enqueueMany, playFromList, playIndices, playNext, playShuffled } from "./queue";
 import { engine } from "./engine";
-import { askConfirm, askText, openPlaylistPicker, openTrackMenu } from "./sheets";
+import { askConfirm, askText, openPlaylistPicker, openSongPicker, openTrackMenu } from "./sheets";
 import { useBackHandler } from "./useBack";
 import { extractArtists } from "./tags";
 import {
@@ -547,8 +547,9 @@ export default function Library({
       "",
       (name) => {
         if (!name.trim()) return;
-        createPlaylist(name);
+        const id = createPlaylist(name);
         toast(`Created “${name.trim()}”`);
+        openSongPicker(id);
       },
       "Create",
     );
@@ -588,7 +589,7 @@ export default function Library({
       </div>
       <h1>{group ? group.title : "Library"}</h1>
       <p className="subtitle">
-        {group ? `${group.sub ? group.sub + " · " : ""}${subtitle}` : subtitle}
+        {group ? `${group.sub && group.kind !== "playlist" ? group.sub + " · " : ""}${subtitle}` : subtitle}
         {loading ? " · Loading…" : ""}
       </p>
 
@@ -609,13 +610,18 @@ export default function Library({
           <button type="button" className="outline-button" disabled={!list.length} onClick={() => enqueueMany(list)}>
             <Icon n="list-music" s={16} /> Add to queue
           </button>
+          {group.playlistId && (
+            <button type="button" className="accent-button" onClick={() => openSongPicker(group.playlistId!)}>
+              <Icon n="plus" s={16} /> Add songs
+            </button>
+          )}
           <button
             type="button"
             className="outline-button"
             disabled={!list.length}
             onClick={() => openPlaylistPicker(list.map((i) => tracks[i]?.id).filter((id): id is string => !!id))}
           >
-            <Icon n="plus" s={16} /> Add to playlist
+            <Icon n="plus" s={16} /> {group.playlistId ? "Copy to playlist" : "Add to playlist"}
           </button>
           {group.playlistId && (
             <>
@@ -755,7 +761,9 @@ export default function Library({
                   : filter === "withLyrics"
                     ? "No tracks with lyrics yet."
                     : group
-                      ? "Nothing here yet."
+                      ? group.playlistId
+                        ? "This playlist is empty. Tap “Add songs” above to fill it."
+                        : "Nothing here yet."
                       : "No songs yet. Add music to your library."
             }
           />
@@ -764,7 +772,7 @@ export default function Library({
         <div className="group-grid">
           {shownGroups.length === 0 && (
             <div className="workspace-empty">
-              {mode === "playlists" ? "No playlists yet. Make one, then add songs from the ⋯ menu." : "Nothing to show yet."}
+              {mode === "playlists" ? "No playlists yet. Make one, then add songs with “Add songs”, or from any song’s ⋯ menu." : "Nothing to show yet."}
             </div>
           )}
           {shownGroups.map((g) => (

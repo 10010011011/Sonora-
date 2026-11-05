@@ -18,6 +18,8 @@ import android.provider.DocumentsContract;
 import android.util.Base64;
 
 import androidx.activity.result.ActivityResult;
+import androidx.core.app.ActivityCompat;
+import androidx.core.app.NotificationManagerCompat;
 
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
@@ -55,7 +57,11 @@ import java.util.concurrent.Executors;
  */
 @CapacitorPlugin(
     name = "SonoraPlayer",
-    permissions = { @Permission(alias = "notifications", strings = { Manifest.permission.POST_NOTIFICATIONS }) }
+    permissions = {
+        @Permission(alias = "notifications", strings = { Manifest.permission.POST_NOTIFICATIONS }),
+        // "Nearby devices" on Android 12+: lets AudioManager return real Bluetooth headset names.
+        @Permission(alias = "headset", strings = { Manifest.permission.BLUETOOTH_CONNECT })
+    }
 )
 public class SonoraPlayerPlugin extends Plugin {
     private static final int MAX_TEXT_BYTES = 32 * 1024 * 1024;
@@ -63,6 +69,8 @@ public class SonoraPlayerPlugin extends Plugin {
     private static volatile SonoraPlayerPlugin instance;
 
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+    /** Small state writes (playlists, settings) get their own thread so a long import can never delay saving them. */
+    private final ExecutorService stateIo = Executors.newSingleThreadExecutor();
     /** Background upkeep (fingerprint backfill, thumbnails) must never delay a library load. */
     private final ExecutorService upkeep = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "sonora-upkeep");
@@ -109,9 +117,20 @@ public class SonoraPlayerPlugin extends Plugin {
     }
 
     /** Events are retained until JS attaches a listener; dropped if the WebView is not alive. */
-    static void emit(String event, JSObject data) {
+    static boolean emit(String event, JSObject data) {
+        return emit(event, data, true);
+    }
+
+    /**
+     * @param retain keep the event for a listener that attaches later. Never use it for transport commands.
+     * @return false when nothing could receive the event (no live plugin, or no listener while not retaining).
+     */
+    static boolean emit(String event, JSObject data, boolean retain) {
         SonoraPlayerPlugin p = instance;
-        if (p != null) p.notifyListeners(event, data, true);
+        if (p == null) return false;
+        if (!retain && !p.hasListeners(event)) return false;
+        p.notifyListeners(event, data, retain);
+        return true;
     }
 
     /** Libraries created before stable ids have no fingerprints, and older covers no thumbnails. */
@@ -459,7 +478,7 @@ public class SonoraPlayerPlugin extends Plugin {
     public void saveState(PluginCall call) {
         String json = call.getString("json");
         if (json == null) { call.reject("json is required"); return; }
-        io.execute(() -> {
+        stateIo.execute(() -> {
             try { store.saveState(json); call.resolve(); }
             catch (Exception e) { call.reject("Could not save state: " + e.getMessage(), "STATE_WRITE_FAILED", e); }
         });
@@ -467,7 +486,7 @@ public class SonoraPlayerPlugin extends Plugin {
 
     @PluginMethod
     public void loadState(PluginCall call) {
-        io.execute(() -> {
+        stateIo.execute(() -> {
             JSObject out = new JSObject();
             String json = store.loadState();
             out.put("json", json == null ? JSONObject.NULL : json);
@@ -480,7 +499,7 @@ public class SonoraPlayerPlugin extends Plugin {
     public void saveUserData(PluginCall call) {
         String json = call.getString("json");
         if (json == null) { call.reject("json is required"); return; }
-        io.execute(() -> {
+        stateIo.execute(() -> {
             try { store.saveUserData(json); call.resolve(); }
             catch (Exception e) { call.reject("Could not save: " + e.getMessage(), "STATE_WRITE_FAILED", e); }
         });
@@ -488,7 +507,7 @@ public class SonoraPlayerPlugin extends Plugin {
 
     @PluginMethod
     public void loadUserData(PluginCall call) {
-        io.execute(() -> {
+        stateIo.execute(() -> {
             JSObject out = new JSObject();
             String json = store.loadUserData();
             out.put("json", json == null ? JSONObject.NULL : json);
@@ -726,7 +745,65 @@ public class SonoraPlayerPlugin extends Plugin {
                     .put("key", key.isEmpty() ? label : key));
             }
         }
-        call.resolve(new JSObject().put("outs", outputs).put("supported", Build.VERSION.SDK_INT >= 23));
+        call.resolve(new JSObject()
+            .put("outs", outputs)
+            .put("supported", Build.VERSION.SDK_INT >= 23)
+            .put("namesHidden", !headsetGranted()));
+    }
+
+    /** Bluetooth output names need the "Nearby devices" permission from Android 12 (API 31) on. */
+    private boolean headsetGranted() {
+        return Build.VERSION.SDK_INT < 31 || getPermissionState("headset") == PermissionState.GRANTED;
+    }
+
+    /** Asks for "Nearby devices" (shown under App info > Permissions). Resolves {granted, blocked}. */
+    @PluginMethod
+    public void requestHeadsetPermission(PluginCall call) {
+        if (headsetGranted()) {
+            call.resolve(new JSObject().put("granted", true).put("blocked", false));
+            return;
+        }
+        requestPermissionForAlias("headset", call, "headsetResult");
+    }
+
+    @PermissionCallback
+    public void headsetResult(PluginCall call) {
+        boolean granted = headsetGranted();
+        // After a denial, "blocked" means Android will not show the prompt again: the user has to use App info.
+        boolean blocked = !granted && Build.VERSION.SDK_INT >= 31 && getActivity() != null
+            && !ActivityCompat.shouldShowRequestPermissionRationale(getActivity(), Manifest.permission.BLUETOOTH_CONNECT);
+        call.resolve(new JSObject().put("granted", granted).put("blocked", blocked));
+    }
+
+    /** Opens Sonora's App info page, where permissions can be switched on after a "don't ask again" denial. */
+    @PluginMethod
+    public void openAppSettings(PluginCall call) {
+        openSettings(call, new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            Uri.fromParts("package", getContext().getPackageName(), null)));
+    }
+
+    /** Opens Sonora's notification settings (falls back to App info on Android 7). */
+    @PluginMethod
+    public void openNotificationSettings(PluginCall call) {
+        Intent i;
+        if (Build.VERSION.SDK_INT >= 26) {
+            i = new Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, getContext().getPackageName());
+        } else {
+            i = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.fromParts("package", getContext().getPackageName(), null));
+        }
+        openSettings(call, i);
+    }
+
+    private void openSettings(PluginCall call, Intent intent) {
+        try {
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(intent);
+            call.resolve();
+        } catch (RuntimeException e) {
+            call.reject("Could not open Android settings", e);
+        }
     }
 
     private static String outputTypeName(int type) {
@@ -776,18 +853,34 @@ public class SonoraPlayerPlugin extends Plugin {
         call.resolve(new JSObject().put("granted", granted));
     }
 
+    /** Runtime permission (Android 13+) and the user's own per-app switch in system settings. */
+    private boolean notificationsAllowed() {
+        boolean runtime = Build.VERSION.SDK_INT < 33 || getPermissionState("notifications") == PermissionState.GRANTED;
+        return runtime && NotificationManagerCompat.from(getContext()).areNotificationsEnabled();
+    }
+
+    /** Resolves {granted, blocked}; "blocked" means only the system settings can turn notifications on now. */
     @PluginMethod
     public void requestNotificationPermission(PluginCall call) {
-        if (Build.VERSION.SDK_INT < 33 || getPermissionState("notifications") == PermissionState.GRANTED) {
-            call.resolve(new JSObject().put("granted", true));
+        if (notificationsAllowed()) {
+            call.resolve(new JSObject().put("granted", true).put("blocked", false));
             return;
         }
-        requestPermissionForAlias("notifications", call, "notificationsResult");
+        if (Build.VERSION.SDK_INT >= 33 && getPermissionState("notifications") != PermissionState.GRANTED) {
+            requestPermissionForAlias("notifications", call, "notificationsResult");
+            return;
+        }
+        // Permission is fine but notifications are switched off for the app in system settings.
+        call.resolve(new JSObject().put("granted", false).put("blocked", true));
     }
 
     @PermissionCallback
     public void notificationsResult(PluginCall call) {
-        call.resolve(new JSObject().put("granted", getPermissionState("notifications") == PermissionState.GRANTED));
+        boolean granted = notificationsAllowed();
+        boolean blocked = !granted && (Build.VERSION.SDK_INT < 33 || getActivity() == null
+            || getPermissionState("notifications") == PermissionState.GRANTED
+            || !ActivityCompat.shouldShowRequestPermissionRationale(getActivity(), Manifest.permission.POST_NOTIFICATIONS));
+        call.resolve(new JSObject().put("granted", granted).put("blocked", blocked));
     }
 
     /* ------------------------------------------------------------------ back button */

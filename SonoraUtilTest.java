@@ -52,6 +52,10 @@ public class SonoraUtilTest {
         eq("65536", SonoraUtil.fpSpan(10_000_000), "span capped"); eq("300", SonoraUtil.fpSpan(300), "span small file"); eq("0", SonoraUtil.fpSpan(-5), "span negative");
         eq("false", SonoraUtil.newId().equals(SonoraUtil.newId()), "ids are unique");
         eq("a/b", SonoraUtil.parentDir("a/b/c.mp3"), "parentDir"); eq("", SonoraUtil.parentDir("c.mp3"), "parentDir root");
+        eq("1", SonoraUtil.sampleSizeFor(400, 300, 512), "small cover is not scaled");
+        eq("1", SonoraUtil.sampleSizeFor(512, 512, 512), "exact fit is not scaled");
+        eq("4", SonoraUtil.sampleSizeFor(3000, 3000, 512), "3000px cover decodes at 1/4 (750px, never below target)");
+        eq("1", SonoraUtil.sampleSizeFor(0, 0, 512), "unknown bounds");
         if (failures == 0) System.out.println("SonoraUtil: all checks passed"); else System.exit(1);
     }
 }
