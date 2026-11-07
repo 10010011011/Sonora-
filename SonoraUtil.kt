@@ -18,7 +18,7 @@ object SonoraUtil {
     private val LEAD_NUM_OPT = Regex("""^\d+[.\s-]*""")
     private val LEAD_NUM_REQ = Regex("""^\d+[.\s-]+""")
     private val ARTIST_SPLIT = Regex("""\s*(?:/|;|,|\s+&\s+|\s+x\s+|\s+feat\.?\s+|\s+ft\.?\s+)\s*""", RegexOption.IGNORE_CASE)
-    private val FEAT_MATCH = Regex("""[([]?\b(?:feat\.?|ft\.?)\s+([^)\]]+)[)\]]?""", RegexOption.IGNORE_CASE)
+    private val FEAT_MATCH = Regex("""(?:\(|\[)?\b(?:feat\.?|ft\.?)\s+([^\]\)]+)(?:\)|\])?""", RegexOption.IGNORE_CASE)
     private val FEAT_SPLIT = Regex("""\s*(?:/|;|,|\s+&\s+)\s*""", RegexOption.IGNORE_CASE)
 
     const val FP_BYTES = 64 * 1024
