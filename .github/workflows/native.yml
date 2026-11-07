@@ -2,7 +2,7 @@ name: Build Native APK
 
 on:
   push:
-    branches: [native, main, master]
+    branches: [native, main, master, sonora-android]
   workflow_dispatch:
     inputs:
       variant:
