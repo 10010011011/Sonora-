@@ -1,0 +1,98 @@
+name: Build Native APK
+
+on:
+  push:
+    branches: [native, main, master]
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "debug or release"
+        default: "debug"
+        type: choice
+        options: [debug, release]
+      cutover:
+        description: "Use the real app id (app.sonora.player) so it installs OVER the old WebView app. ONE-WAY DOOR."
+        default: false
+        type: boolean
+      ffmpeg:
+        description: "Include the FFmpeg decoder module (GPL-3.0)"
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install Android platform and build tools
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.4
+
+      - name: Install font tooling
+        run: pip install fonttools brotli
+
+      - name: Assemble Gradle project from flat files
+        run: bash assemble_native.sh
+
+      - name: Unit tests
+        run: |
+          set -o pipefail
+          gradle -p native :app:testDebugUnitTest --console=plain --stacktrace 2>&1 | tee native/test.log
+
+      - name: Build APK
+        run: |
+          set -o pipefail
+          VARIANT="${{ inputs.variant || 'debug' }}"
+          CUT="${{ inputs.cutover || 'false' }}"
+          FFM="${{ inputs.ffmpeg || 'false' }}"
+          TASK=assembleDebug
+          if [ "$VARIANT" = "release" ]; then TASK=assembleRelease; fi
+          gradle -p native ":app:$TASK" -Pcutover="$CUT" -PwithFfmpeg="$FFM" --console=plain --stacktrace 2>&1 | tee native/build.log
+
+      - name: Error digest (paste this into the chat)
+        if: failure()
+        run: bash digest_errors.sh native/test.log native/build.log >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Collect APK
+        if: success()
+        run: |
+          mkdir -p out
+          find native/app/build/outputs/apk -name '*.apk' -exec cp {} out/ \;
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: sonora-native-apk
+          path: out/*.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs
+          path: native/*.log
+          if-no-files-found: ignore

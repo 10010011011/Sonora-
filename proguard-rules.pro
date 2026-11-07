@@ -1,0 +1,3 @@
+-keepattributes *Annotation*, InnerClasses, Signature
+-keep class androidx.media3.decoder.ffmpeg.** { *; }
+-dontwarn org.jetbrains.annotations.**

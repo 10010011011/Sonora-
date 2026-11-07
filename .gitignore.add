@@ -1,0 +1,3 @@
+# --- add these lines to the repo .gitignore (native branch) ---
+/native/
+/out/
