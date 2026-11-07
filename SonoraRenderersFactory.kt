@@ -25,7 +25,6 @@ class SonoraRenderersFactory(context: Context, private val holder: DspParamsHold
         context: Context,
         enableFloatOutput: Boolean,
         enableAudioTrackPlaybackParams: Boolean,
-        enableOffload: Boolean,
     ): AudioSink? {
         val processor = SonoraAudioProcessor(holder)
         return DefaultAudioSink.Builder(context)
