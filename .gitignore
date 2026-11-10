@@ -1,8 +1,0 @@
-node_modules/
-dist/
-/android/
-out/
-.env*
-!.env.example
-.DS_Store
-sonora-github-flat.zip
