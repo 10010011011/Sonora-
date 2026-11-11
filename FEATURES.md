@@ -20,6 +20,7 @@ Unit-tested (52 tests) and lint-clean; the emulator test runs on GitHub. Use the
 | Minor | Rescan folders: finds new, changed and deleted files, skips unchanged ones | Compares size + modified time per document | Same | [ ] |
 | Minor | Remove a folder (files untouched) and revoked-access notice | Settings > Library > Folders | Same | [ ] |
 | Major | Tag reading: title, artist, album, duration, embedded cover art | MediaMetadataRetriever; cover saved at max 1024 px plus a 160 px list thumbnail | Same | [ ] |
+| Minor | Manually set or replace a song thumbnail | Track menu > Set thumbnail…; the image is copied to private artwork storage and retained across folder rescans | Same | [ ] |
 | Minor | ReplayGain tags and embedded lyrics from ID3v2, FLAC/Ogg and MP4 | Media3 MetadataRetriever at import, and again when a track starts | Same | [ ] |
 | Minor | File-name fallback when a file has no tags | "Artist - Title.ext" pattern; untagged albums are "Local audio" as before; folder cover.jpg / folder.jpg used when no embedded art | Same | [ ] |
 | Minor | Sidecar .lrc / .srt / .vtt files paired automatically with the song of the same name | Works for picked files and for folders; lyric files picked alone attach to existing songs | Same | [ ] |
