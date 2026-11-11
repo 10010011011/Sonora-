@@ -1,0 +1,112 @@
+name: Build Sonora Native APK
+
+on:
+  push:
+    branches: [main, master, sonora-v2, sonora-native]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      # Works whether the Android project is the repository root or lives in a sonora-native/ folder.
+      - name: Locate Android project
+        id: loc
+        run: |
+          if [ -f sonora-native/settings.gradle.kts ]; then echo "dir=sonora-native" >> "$GITHUB_OUTPUT"; else echo "dir=." >> "$GITHUB_OUTPUT"; fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" > /dev/null
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Unit tests (52 tests)
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: |
+          chmod +x gradlew
+          ./gradlew testDebugUnitTest --no-daemon --stacktrace
+
+      # Release is the one to install (minified: smaller and faster). Debug is the unminified fallback.
+      # Both are signed with the same key, so either installs over the other and over Sonora 1.2.
+      - name: Build APKs
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: ./gradlew assembleRelease assembleDebug --no-daemon --stacktrace
+
+      - name: Prepare APK artifacts
+        run: |
+          mkdir -p out
+          REF="$(echo "${GITHUB_REF_NAME}" | tr '/' '-')"
+          cp "${{ steps.loc.outputs.dir }}/app/build/outputs/apk/release/app-release.apk" "out/Sonora-native-${REF}.apk"
+          cp "${{ steps.loc.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk" "out/Sonora-native-${REF}-debug.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sonora-native-apk
+          path: out/*.apk
+          if-no-files-found: error
+
+      - name: Attach APKs to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.apk
+
+  # The reported playback bugs, as an emulator test: 200 random seeks that must all land and keep
+  # playing, plus a clean run through 60–70% of a song. See PlaybackRobustnessTest.
+  emulator-robustness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate Android project
+        id: loc
+        run: |
+          if [ -f sonora-native/settings.gradle.kts ]; then echo "dir=sonora-native" >> "$GITHUB_OUTPUT"; else echo "dir=." >> "$GITHUB_OUTPUT"; fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Seek-robustness tests on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          target: default
+          arch: x86_64
+          profile: pixel_6
+          ram-size: 4096M
+          heap-size: 1024M
+          disk-size: 8192M
+          working-directory: ${{ steps.loc.outputs.dir }}
+          script: |
+            chmod +x gradlew
+            sdkmanager "platforms;android-36" "build-tools;36.0.0" > /dev/null
+            ./gradlew connectedDebugAndroidTest --no-daemon --stacktrace
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-test-reports
+          path: ${{ steps.loc.outputs.dir }}/app/build/reports/androidTests/
+          if-no-files-found: ignore
