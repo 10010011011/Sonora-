@@ -186,6 +186,28 @@ object Importer {
         }.getOrDefault(null to null)
     }
 
+    /** Copies user-selected image artwork into Sonora's private cover store and pins it to this track. */
+    fun setArtwork(trackId: String, imageUri: Uri) {
+        if (S.track(trackId) == null) return
+        S.scope.launch {
+            val saved = withContext(Dispatchers.IO) {
+                runCatching {
+                    val bytes = S.app.contentResolver.openInputStream(imageUri)?.use { it.readBytes() }
+                        ?: throw IllegalStateException("Could not read that image")
+                    saveCover("$trackId-custom-${System.currentTimeMillis()}", bytes)
+                }.onFailure { Diag.log("artwork-failed", it.message ?: "Could not read image") }.getOrNull()
+            }
+            val cover = saved?.first
+            val thumb = saved?.second
+            if (cover == null || thumb == null) {
+                S.toast("Couldn't use that image")
+                return@launch
+            }
+            S.patchTrack(trackId) { it.copy(cover = cover, thumb = thumb, customArtwork = true) }
+            S.toast("Thumbnail updated")
+        }
+    }
+
     /** "size:sha1(first 64 KB + last 64 KB)" - the same fingerprint scheme as the Capacitor build. */
     private fun fingerprint(f: File): String {
         val size = f.length()
@@ -421,7 +443,7 @@ object Importer {
                             val art = meta.art ?: byDir[d.dir]?.firstOrNull { it.name.lowercase() in COVER_NAMES }?.let { c ->
                                 runCatching { S.app.contentResolver.openInputStream(c.uri)?.use { it.readBytes() } }.getOrNull()
                             }
-                            val (cover, thumb) = saveCover(id, art)
+                            val (cover, thumb) = if (old?.customArtwork == true) old.cover to old.thumb else saveCover(id, art)
                             val extra = Tags.probe(d.uri)
                             val t = Track(
                                 id = id, uri = key, fileName = d.name, size = d.size, lastModified = d.modified, path = "${d.dir}/${d.name}",
@@ -430,6 +452,7 @@ object Importer {
                                 rgTrack = extra.rgTrack, rgAlbum = extra.rgAlbum, embeddedLyrics = extra.lyrics, sidecar = sidecar,
                                 addedAt = old?.addedAt ?: System.currentTimeMillis(), playCount = old?.playCount ?: 0, lastPlayedAt = old?.lastPlayedAt ?: 0,
                                 storage = "tree", treeUri = folder.uri, edited = old?.edited ?: false,
+                                customArtwork = old?.customArtwork ?: false,
                             )
                             if (old != null) {
                                 S.patchTrack(id) { t }

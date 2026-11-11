@@ -1,5 +1,7 @@
 package app.sonora.player.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -173,6 +175,9 @@ private fun TrackMenu(id: String, playlistId: String?) {
     val ps by S.player.collectAsState()
     val user by S.user.collectAsState()
     val track = remember(tracks, id) { S.track(id) }
+    val artworkPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) Importer.setArtwork(id, uri)
+    }
     if (track == null) {
         LaunchedEffect(Unit) { Ui.menu.value = null }
         return
@@ -193,6 +198,7 @@ private fun TrackMenu(id: String, playlistId: String?) {
         if (playlistId != null && pos >= 0 && pos < count - 1) SheetRow(Ic.Down, "Move down in playlist", onClick = act { S.movePlaylistTrack(playlistId, pos, pos + 1) })
         SheetRow(if (liked) Ic.Heart else Ic.HeartOutline, if (liked) "Remove from Liked songs" else "Add to Liked songs", tint = if (liked) p.accent2 else p.muted, onClick = act { S.toggleLike(id) })
         if (ps.trackId == id) SheetRow(Ic.Clock, "Bookmark this moment", onClick = act { S.addBookmark(id, Engine.time); S.toast("Bookmarked ${fmt(Engine.time)}") })
+        SheetRow(Ic.Image, "Set thumbnail…") { artworkPicker.launch(arrayOf("image/*")) }
         SheetRow(Ic.Edit, "Edit title, artist, album…") { Ui.tags.value = id }
         if (ps.trackId != id) SheetRow(Ic.Minus, "Remove from library", onClick = act {
             Ui.askConfirm("Remove from library", "“${track.title}” is removed from Sonora. Files in your own folders are not deleted.", "Remove") {

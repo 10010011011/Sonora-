@@ -42,6 +42,8 @@ data class Track(
     val edited: Boolean = false,
     /** True once loudness analysis ran (so it is not repeated). */
     val analyzed: Boolean = false,
+    /** True when the user selected artwork that should take priority over embedded/folder art. */
+    val customArtwork: Boolean = false,
 )
 
 @Serializable
