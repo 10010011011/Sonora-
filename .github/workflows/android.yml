@@ -2,7 +2,7 @@ name: Build Sonora Native APK
 
 on:
   push:
-    branches: [main, master, sonora-v2, sonora-native]
+    branches: [main, master, sonora-v2, sonora-native, Native-Android-2.2.0]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
