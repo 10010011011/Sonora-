@@ -81,6 +81,7 @@ class PlaybackService : MediaSessionService() {
         // setPlayer must run on the players' looper (main).
         Engine.sessionSetter = { p -> handler.post { runCatching { session?.setPlayer(p) } } }
         Engine.forEachPlayer { it.addListener(idleWatch) }
+        SpatialHub.start()
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = session
@@ -96,6 +97,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     override fun onDestroy() {
+        SpatialHub.stop()
         handler.removeCallbacks(idleStop)
         Engine.forEachPlayer { runCatching { it.removeListener(idleWatch) } }
         session?.release()
