@@ -69,6 +69,12 @@ class Biquad {
         return this
     }
 
+    fun highPass(f: Double, q: Double, sr: Double): Biquad {
+        val w = 2 * PI * f.coerceAtMost(sr * 0.45) / sr; val c = cos(w); val al = sin(w) / (2 * q)
+        norm((1 + c) / 2, -(1 + c), (1 + c) / 2, 1 + al, -2 * c, 1 - al)
+        return this
+    }
+
     fun run(x: Double, ch: Int): Double {
         val i = ch * 2
         val y = b0 * x + z[i]
@@ -85,8 +91,8 @@ class Biquad {
     }
 }
 
-/** Small Schroeder reverb (4 damped combs + 2 all-passes per side) for "Room ambience". */
-private class Reverb(sr: Int) {
+/** Small Schroeder reverb (4 damped combs + 2 all-passes per side) for "Room ambience" and the spatial echo. */
+internal class Reverb(sr: Int) {
     private val k = sr / 44100.0
     private val combLen = intArrayOf(1557, 1617, 1491, 1422)
     private val apLen = intArrayOf(225, 556)
@@ -128,7 +134,7 @@ private class Reverb(sr: Int) {
 /**
  * Sonora's signal chain as a Media3 AudioProcessor (the native counterpart of the WebAudio graph):
  * ReplayGain x pre-amp -> bass shelf -> 10-band EQ -> treble shelf -> mid/side stage (mono / vocal focus / karaoke / width)
- * -> crossfeed -> 8D orbit -> room ambience -> boost -> brick-wall limiter. Also feeds the visualisers and meters.
+ * -> crossfeed -> spatial 8D (automatic, song-aware) -> room ambience -> boost -> brick-wall limiter. Also feeds the visualisers and meters.
  */
 class SonoraDsp : BaseAudioProcessor() {
     @Volatile var params = DspParams()
@@ -140,6 +146,15 @@ class SonoraDsp : BaseAudioProcessor() {
 
     /** When the last samples were written; the visualiser mixes only DSPs that wrote recently. */
     @Volatile var lastWriteMs = 0L
+
+    /** Frames that have passed through this chain since the player was built. The spatial timeline is read against it. */
+    @Volatile var sampleFrames = 0L
+
+    /** The analysed timeline of the song this chain is playing. Set by [SpatialHub] on the main thread; null = no effect yet. */
+    @Volatile internal var spTimeline: SpTimeline? = null
+
+    /** Maps [sampleFrames] to media time. Always replaced as a whole, so the audio thread never reads a half-written pair. */
+    @Volatile internal var spAnchor = SpAnchor(0.0, 0L)
 
     val tapL = FloatArray(TAP)
     val tapR = FloatArray(TAP)
@@ -153,13 +168,14 @@ class SonoraDsp : BaseAudioProcessor() {
     private val bassKeep = Biquad()
     private val cfLp = Biquad()
     private var reverb: Reverb? = null
+    private var stage = SpStage(44100)
     private var gPre = 1.0; private var gPreT = 1.0
     private var gBoost = 1.0; private var gBoostT = 1.0
     private var sideT = 1.0; private var side = 1.0
     private var karaoke = false
     private var spatial = false
+    private var spatialOn = false
     private var cfG = 0.0
-    private var orbitMix = 0.0; private var orbitT = 0.0; private var phase = 0.0; private var orbitInc = 0.0
     private var roomMix = 0.0; private var roomT = 0.0
     private var limG = 1.0
     private var rel = 0.0002
@@ -171,6 +187,7 @@ class SonoraDsp : BaseAudioProcessor() {
         ch = inputAudioFormat.channelCount
         applied = null
         reverb = null
+        stage = SpStage(sampleRate)
         return inputAudioFormat
     }
 
@@ -196,8 +213,7 @@ class SonoraDsp : BaseAudioProcessor() {
         spatial = p.stereoMode != "normal" || abs(p.width - 1) > 0.005 || p.crossfeed > 0.005
         bassKeep.lowPass(140.0, 0.707, sr)
         cfLp.lowPass(700.0, 0.707, sr)
-        orbitT = if (p.orbit) 1.0 else 0.0
-        orbitInc = 2 * PI * p.orbitSpeed / sr
+        spatialOn = p.orbit
         roomT = p.room
         rel = 1 - exp(-1.0 / (0.12 * sr))
         // The limiter only earns its place when something can push peaks past full scale. With flat EQ, no boost and
@@ -217,18 +233,19 @@ class SonoraDsp : BaseAudioProcessor() {
         if (p !== applied) recalc(p)
         val stereo = ch == 2
         val frames = n / (2 * ch)
+        val base = sampleFrames
         var pos = inputBuffer.position()
         var tp = tapPos
         var minG = 1.0
         val filters = active
         val tap = tapOn
         // Effects that are still fading out keep the limiter in the path until they are silent.
-        val limiter = limiterOn || (p.limiter && (orbitMix > 0.001 || roomMix > 0.001))
-        if (!limiter && filters.isEmpty() && !spatial && orbitT == 0.0 && orbitMix <= 0.001 && roomT == 0.0 && roomMix <= 0.001 &&
+        val limiter = limiterOn || (p.limiter && (stage.busy() || roomMix > 0.001))
+        if (!limiter && filters.isEmpty() && !spatial && !spatialOn && !stage.busy() && roomT == 0.0 && roomMix <= 0.001 &&
             abs(gPreT - 1) < 1e-4 && abs(gPre - 1) < 2e-3 && abs(gBoostT - 1) < 1e-4 && abs(gBoost - 1) < 2e-3
         ) {
             // Nothing is switched on: pass the samples through untouched (bit-perfect), at almost no CPU cost.
-            gPre = 1.0; gBoost = 1.0; limG = 1.0; orbitMix = 0.0; roomMix = 0.0
+            gPre = 1.0; gBoost = 1.0; limG = 1.0; roomMix = 0.0
             if (tap) {
                 for (f in 0 until frames) {
                     val l = inputBuffer.getShort(pos) / 32768f
@@ -240,12 +257,15 @@ class SonoraDsp : BaseAudioProcessor() {
                 tapPos = tp
             }
             reductionDb = 0f
+            sampleFrames = base + frames
             out.put(inputBuffer)
             out.flip()
             return
         }
         if (!limiter) limG = 1.0
         for (f in 0 until frames) {
+            // Once per 32 frames: pick the song's automation for this moment (cheap; the audio thread only reads).
+            if ((f and 31) == 0) stage.block(spTimeline, spAnchor, base + f, spatialOn && stereo)
             var l = inputBuffer.getShort(pos) / 32768.0
             var r = if (stereo) inputBuffer.getShort(pos + 2) / 32768.0 else l
             pos += 2 * ch
@@ -275,15 +295,10 @@ class SonoraDsp : BaseAudioProcessor() {
                         l = (l + cfG * rl) * nrm; r = (r + cfG * ll) * nrm
                     }
                 }
-                orbitMix += (orbitT - orbitMix) * 0.0004
-                if (orbitMix > 0.001) {
-                    phase += orbitInc
-                    if (phase > 2 * PI) phase -= 2 * PI
-                    val m = (l + r) * 0.5
-                    val a = (sin(phase) + 1) * PI / 4
-                    val depth = (0.8 + 0.2 * cos(phase)) * 1.414
-                    l = l * (1 - 0.8 * orbitMix) + m * cos(a) * depth * orbitMix
-                    r = r * (1 - 0.8 * orbitMix) + m * sin(a) * depth * orbitMix
+                if (spatialOn || stage.busy()) {
+                    stage.process(l, r)
+                    l = stage.outL
+                    r = stage.outR
                 }
                 roomMix += (roomT - roomMix) * 0.0004
                 if (roomMix > 0.001) {
@@ -317,6 +332,7 @@ class SonoraDsp : BaseAudioProcessor() {
         tapPos = tp
         reductionDb = if (limiter) (20 * log10(minG)).toFloat() else 0f
         inputBuffer.position(inputBuffer.limit())
+        sampleFrames = base + frames
         out.flip()
     }
 
