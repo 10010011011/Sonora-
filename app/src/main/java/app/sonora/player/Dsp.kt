@@ -151,8 +151,11 @@ class SonoraDsp : BaseAudioProcessor() {
     /** Frames that have passed through this chain since the player was built. The spatial timeline is read against it. */
     @Volatile var sampleFrames = 0L
 
-    /** The analysed timeline of the song this chain is playing. Set by [SpatialHub] on the main thread; null = generic motion. */
-    @Volatile internal var spTimeline: SpTimeline? = null
+    /** The song this chain is playing, read from the stream at every flush. */
+    @Volatile internal var spId: String? = null
+
+    /** The same, from the player: only a fallback for when the stream metadata carries no timeline. Set by [SpatialHub]. */
+    @Volatile internal var spHint: String? = null
 
     /** Maps [sampleFrames] to media time. Always replaced as a whole, so the audio thread never reads a half-written pair. */
     @Volatile internal var spAnchor = SpAnchor(0.0, 0L)
@@ -196,6 +199,16 @@ class SonoraDsp : BaseAudioProcessor() {
         reverb = null
         stage = SpStage(sampleRate)
         return inputAudioFormat
+    }
+
+    /**
+     * Media3 tells the processor where the stream restarts (seek, skip, next song). The first frame after this call is
+     * media time positionOffsetUs, so the spatial clock is exact, however much audio is buffered ahead of the speaker.
+     */
+    override fun onFlush(streamMetadata: AudioProcessor.StreamMetadata) {
+        spAnchor = SpAnchor(max(0L, streamMetadata.positionOffsetUs) / 1_000_000.0, sampleFrames)
+        spId = SpStore.idOf(streamMetadata)
+        stage = SpStage(sampleRate)
     }
 
     private fun recalc(p: DspParams) {
@@ -244,8 +257,15 @@ class SonoraDsp : BaseAudioProcessor() {
         // 0 off, 1 8D orbit, 2 immersive surround. Mono never gets the spatial stage.
         val spMode = if (!stereo) 0 else if (spAtmos) 2 else if (spatialOn) 1 else 0
         // Auto: the spatial stage owns stereo width, crossfeed and room, so the user's sliders for those are ignored.
+        // 8D gets a slightly narrower picture so the moving voice carries more of it; immersive keeps the full width.
         val auto = spAuto && spMode != 0
+        val msOn = if (auto) spMode == 1 else spatial
+        val sideGoal = if (msOn) (if (auto) AUTO_WIDTH_8D else sideT) else 1.0
+        val karaokeNow = karaoke && !auto
+        val cfNow = if (auto) 0.0 else cfG
+        val msRun = msOn || abs(side - 1.0) > 0.003
         val roomTarget = if (auto) 0.0 else roomT
+        val tl = if (spMode == 1) SpStore.map[spId ?: spHint ?: ""] else null
         var pos = inputBuffer.position()
         var tp = tapPos
         var minG = 1.0
@@ -253,7 +273,7 @@ class SonoraDsp : BaseAudioProcessor() {
         val tap = tapOn
         // Effects that are still fading out keep the limiter in the path until they are silent.
         val limiter = limiterOn || (p.limiter && (spMode != 0 || stage.busy() || roomMix > 0.001))
-        if (!limiter && filters.isEmpty() && !spatial && spMode == 0 && !stage.busy() && roomTarget == 0.0 && roomMix <= 0.001 &&
+        if (!limiter && filters.isEmpty() && !msRun && spMode == 0 && !stage.busy() && roomTarget == 0.0 && roomMix <= 0.001 &&
             abs(gPreT - 1) < 1e-4 && abs(gPre - 1) < 2e-3 && abs(gBoostT - 1) < 1e-4 && abs(gBoost - 1) < 2e-3
         ) {
             // Nothing is switched on: pass the samples through untouched (bit-perfect), at almost no CPU cost.
@@ -277,7 +297,7 @@ class SonoraDsp : BaseAudioProcessor() {
         if (!limiter) limG = 1.0
         for (f in 0 until frames) {
             // Once per 32 frames: pick the spatial targets for this moment (cheap; the audio thread only reads).
-            if ((f and 31) == 0) stage.block(spTimeline, spAnchor, base + f, spMode)
+            if ((f and 31) == 0) stage.block(tl, spAnchor, base + f, spMode)
             var l = inputBuffer.getShort(pos) / 32768.0
             var r = if (stereo) inputBuffer.getShort(pos + 2) / 32768.0 else l
             pos += 2 * ch
@@ -289,22 +309,22 @@ class SonoraDsp : BaseAudioProcessor() {
             }
             if (!stereo) r = l
             if (stereo) {
-                if (spatial && !auto) {
-                    side += (sideT - side) * 0.0015
+                if (msRun) {
+                    side += (sideGoal - side) * 0.0015
                     val m = (l + r) * 0.5
                     val s = (l - r) * 0.5
-                    if (karaoke) {
+                    if (karaokeNow) {
                         // Cancel whatever is panned dead centre (the lead vocal) but keep the bass.
                         val low = bassKeep.run(m, 0)
                         l = s + low; r = -s + low
                     } else {
                         l = m + s * side; r = m - s * side
                     }
-                    if (cfG > 0.001) {
+                    if (cfNow > 0.001) {
                         val ll = cfLp.run(l, 0)
                         val rl = cfLp.run(r, 1)
-                        val nrm = 1 / (1 + cfG * 0.5)
-                        l = (l + cfG * rl) * nrm; r = (r + cfG * ll) * nrm
+                        val nrm = 1 / (1 + cfNow * 0.5)
+                        l = (l + cfNow * rl) * nrm; r = (r + cfNow * ll) * nrm
                     }
                 }
                 if (spMode != 0 || stage.busy()) {
@@ -360,6 +380,9 @@ class SonoraDsp : BaseAudioProcessor() {
     companion object {
         const val TAP = 8192
         const val THRESHOLD = 0.966
+
+        /** Stereo width auto mode gives 8D: a little narrower, so the moving voice carries more of the picture. */
+        const val AUTO_WIDTH_8D = 0.7
 
         /** Combined EQ response in dB at each frequency, for the live response curve. */
         fun response(p: DspParams, freqs: DoubleArray): DoubleArray {

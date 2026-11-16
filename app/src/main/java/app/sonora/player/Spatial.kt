@@ -12,9 +12,12 @@ import android.os.Process
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
+import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.exoplayer.ExoPlayer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import kotlin.math.PI
 import kotlin.math.abs
@@ -35,17 +38,18 @@ import kotlin.math.sqrt
  *
  * 1. Pre-scan (background, once per song, 8D only): energy in the vocal band (250-3500 Hz) is followed over time. Gaps in it
  *    cut the song into musical chunks. Each chunk is judged against its neighbours: louder = impact (centre, close); a quieter
- *    repeat of the line before it = echo (far, behind). Bass hits give a beat pulse; loudness gives intensity.
+ *    repeat of the line before it = echo (far, behind). Bass hits give a beat pulse; loudness gives intensity. The first 45 s
+ *    are published as soon as they are decoded, so the real timeline takes over within about a second.
  * 2. Timeline: where each chunk sits (lines alternate sides, glides land as the next line starts, speed-capped), how close
- *    or far it is, how wide the orbiting band is, plus the rear and overhead bed. Until the song is analysed, 8D uses a steady
- *    generic swing, so there is never silence while the analysis runs.
- * 3. Real-time render (audio thread, one stage per player): voice (400-4000 Hz centre) and band (the rest) are placed
- *    binaurally, reverb sends carry the distance, and the spatial part is levelled to the loudness of the plain signal.
+ *    or far it is, how wide the orbiting band is, plus the rear and overhead bed. Until then 8D uses a steady generic swing.
+ * 3. Real-time render (audio thread, one stage per player): voice (320-6000 Hz centre) and band (the rest) are placed
+ *    binaurally, reverb sends carry the distance, and the spatial part is levelled to the plain signal (never louder in the peaks).
  *    Immersive surround uses the same renderer with a fixed front stage and no analysis at all.
- * The audio thread only reads targets; it never analyses or allocates.
+ * The audio thread only reads targets; it never analyses or allocates. Its clock is exact: Media3 reports the stream's start
+ * position at every flush.
  */
 
-/** Level of the rear and overhead ambience. */
+/** Level of the rear and overhead ambience (a share of the side signal moved out of the front). */
 private const val SP_BED = 0.6
 
 /** How far the voice swings from the centre, as a share of the full move. */
@@ -79,6 +83,29 @@ internal class SpTimeline(
     }
 }
 
+/** Timelines by song id. Written on the main thread, read by the audio thread, hence the concurrent map. */
+internal object SpStore {
+    val map = ConcurrentHashMap<String, SpTimeline>()
+
+    /** Which song a stream belongs to, from the metadata Media3 hands the processor at every flush. */
+    fun idOf(m: AudioProcessor.StreamMetadata): String? = try {
+        val tl = m.timeline
+        val uid = m.periodUid
+        if (uid == null || tl.isEmpty) {
+            null
+        } else {
+            val idx = tl.getIndexOfPeriod(uid)
+            if (idx == C.INDEX_UNSET) {
+                null
+            } else {
+                tl.getWindow(tl.getPeriod(idx, Timeline.Period()).windowIndex, Timeline.Window()).mediaItem.mediaId.takeIf { it.isNotEmpty() }
+            }
+        }
+    } catch (e: Exception) {
+        null
+    }
+}
+
 /** Delay line for interaural time, fractional, linear interpolation. */
 private class SpDelay {
     private val buf = DoubleArray(256)
@@ -100,8 +127,11 @@ private class SpDelay {
     }
 }
 
-/** Cheap binaural placement: interaural time and level, far-ear shading, and a pinna shelf for front, back and height. */
-private class SpBinaural(private val sr: Double) {
+/**
+ * Cheap binaural placement: interaural time and level, far-ear shading, and a pinna shelf for front, back and height.
+ * [shadow] scales how strongly the far ear is shaded: full for the voice, gentler for the wide band so it keeps its tone.
+ */
+private class SpBinaural(private val sr: Double, private val shadow: Double) {
     private val dl = SpDelay()
     private val dr = SpDelay()
     private val shL = Biquad()
@@ -132,12 +162,13 @@ private class SpBinaural(private val sr: Double) {
         val a = azDeg * PI / 180
         val e = elDeg * PI / 180
         val s = (sin(a) * cos(e)).coerceIn(-1.0, 1.0)
+        val ab = abs(s) * shadow
         tL = half * (1 + s)
         tR = half * (1 - s)
-        val far = 10.0.pow(-9.0 * abs(s) / 20)
+        val far = 10.0.pow(-9.0 * ab / 20)
         tgL = if (s > 0) far else 1.0
         tgR = if (s < 0) far else 1.0
-        val cut = max(3500.0, top - 12000.0 * abs(s))
+        val cut = max(3500.0, top - 12000.0 * ab)
         shL.lowPass(if (s > 0) cut else top, 0.707, sr)
         shR.lowPass(if (s < 0) cut else top, 0.707, sr)
         val back = max(0.0, -cos(a)) * cos(e)
@@ -162,25 +193,29 @@ private class SpBinaural(private val sr: Double) {
 internal class SpStage(sr: Int) {
     private val d = sr.toDouble()
     private val kg = 1 - exp(-1 / (0.02 * d))
-    private val kEnv = 1 - exp(-1 / (0.8 * d)) // level envelopes, about 0.8 s
-    private val kMatch = 1 - exp(-1 / (0.3 * d))
+    private val kEnv = 1 - exp(-1 / (0.8 * d)) // loudness envelopes, about 0.8 s
+    private val kUp = 1 - exp(-1 / (0.5 * d)) // level match rises slowly...
+    private val kDown = 1 - exp(-1 / (0.05 * d)) // ...and drops fast, so peaks never get past the plain signal
+    private val pkRel = exp(-1 / (0.4 * d))
     private val slewStep = 700.0 * 32 / d // at most 700 degrees per second
     private fun cut(f: Double) = min(f, 0.45 * d)
 
-    private val vHp1 = Biquad().highPass(400.0, 0.707, d)
-    private val vHp2 = Biquad().highPass(400.0, 0.707, d)
-    private val vLp1 = Biquad().lowPass(cut(4000.0), 0.707, d)
-    private val vLp2 = Biquad().lowPass(cut(4000.0), 0.707, d)
+    private val vHp1 = Biquad().highPass(320.0, 0.707, d)
+    private val vHp2 = Biquad().highPass(320.0, 0.707, d)
+    private val vLp1 = Biquad().lowPass(cut(6000.0), 0.707, d)
+    private val vLp2 = Biquad().lowPass(cut(6000.0), 0.707, d)
     private val vDark = Biquad().lowPass(cut(12000.0), 0.707, d)
     private val bandHp = Biquad().highPass(1200.0, 0.707, d)
-    private val voice = SpBinaural(d)
-    private val bandL = SpBinaural(d)
-    private val bandR = SpBinaural(d)
-    private val rearL = SpBinaural(d)
-    private val rearR = SpBinaural(d)
-    private val highL = SpBinaural(d)
-    private val highR = SpBinaural(d)
-    private val echo = SpBinaural(d)
+    private val sHp1 = Biquad().highPass(cut(4000.0), 0.707, d)
+    private val sHp2 = Biquad().highPass(cut(4000.0), 0.707, d)
+    private val voice = SpBinaural(d, 1.0)
+    private val bandL = SpBinaural(d, 0.6)
+    private val bandR = SpBinaural(d, 0.6)
+    private val rearL = SpBinaural(d, 0.5)
+    private val rearR = SpBinaural(d, 0.5)
+    private val highL = SpBinaural(d, 0.5)
+    private val highR = SpBinaural(d, 0.5)
+    private val echo = SpBinaural(d, 0.5)
     private val rev = Reverb(sr)
 
     private var dual = false
@@ -201,10 +236,12 @@ internal class SpStage(sr: Int) {
     private var tHb = 0.0
     private var hb = 0.0
     private var azV = 0.0
-    private var azL = -85.0
-    private var azR = 85.0
+    private var azL = -38.0
+    private var azR = 38.0
     private var pIn = 1e-6
     private var pOut = 1e-6
+    private var pkIn = 1e-4
+    private var pkOut = 1e-4
     private var match = 1.0
     var outL = 0.0
     var outR = 0.0
@@ -219,7 +256,12 @@ internal class SpStage(sr: Int) {
 
     fun busy(): Boolean = mixT > 0.0 || mix > 0.001
 
-    private fun slew(c: Double, target: Double): Double = c + (target - c).coerceIn(-slewStep, slewStep)
+    /** Moves an angle towards a target by the shortest way round, at most [slewStep] a block. Angles keep growing; only the difference matters. */
+    private fun slewAng(c: Double, target: Double): Double {
+        var dd = (target - c) % 360
+        if (dd > 180) dd -= 360 else if (dd < -180) dd += 360
+        return c + dd.coerceIn(-slewStep, slewStep)
+    }
 
     /** Once per 32 frames. m: 0 off, 1 8D orbit, 2 immersive surround. fAbs = absolute frame index of the block start. */
     fun block(tl: SpTimeline?, an: SpAnchor, fAbs: Long, m: Int) {
@@ -236,17 +278,16 @@ internal class SpStage(sr: Int) {
         }
     }
 
-    /** Immersive: fixed front stage (centre voice, wide band) and rear and overhead ambience from the side signal. */
+    /** Immersive: fixed front stage (centre voice, wide band) and rear and overhead ambience taken out of the side signal. */
     private fun immersiveTargets() {
         dual = false
         tDry = 1.0
-        tCl = 0.3
-        tSend = 0.16
-        tBand = 0.10
+        tCl = 0.0
+        tSend = 0.14
+        tBand = 0.08
         tIg = 1.0
-        tRb = SP_BED * 0.5
-        tHb = SP_BED * 0.3
-        vDark.lowPass(cut(12000.0), 0.707, d)
+        tRb = 0.42
+        tHb = 0.32
         voice.aim(0.0, 0.0)
         bandL.aim(-30.0, 0.0)
         bandR.aim(30.0, 0.0)
@@ -255,17 +296,17 @@ internal class SpStage(sr: Int) {
     /** 8D before the song is analysed: a steady swing, so there is never silence while the timeline is prepared. */
     private fun genericTargets(t: Double) {
         dual = false
-        tDry = 0.78
+        tDry = 0.8
         tCl = 0.0
-        tSend = 0.27
-        tBand = 0.085
+        tSend = 0.24
+        tBand = 0.08
         tIg = 1.0
         tRb = SP_BED * 0.55 * 0.75
         tHb = SP_BED * 0.5 * 0.67
-        vDark.lowPass(cut(12000.0), 0.707, d)
-        azV = slew(azV, 70 * sin(2 * PI * t / 10.0))
-        azL = slew(azL, 360 * 0.03 * t - 40)
-        azR = slew(azR, 360 * 0.03 * t + 40)
+        val orbit = (360 * 0.03 * t) % 360
+        azV = slewAng(azV, 70 * sin(2 * PI * t / 10.0))
+        azL = slewAng(azL, orbit - 38)
+        azR = slewAng(azR, orbit + 38)
         voice.aim(azV, 0.0)
         bandL.aim(azL, 0.0)
         bandR.aim(azR, 0.0)
@@ -281,7 +322,7 @@ internal class SpStage(sr: Int) {
         tDry = 10.0.pow(-0.45 * dep) * cos(a)
         tCl = sin(a)
         tSend = (0.2 + 0.3 * dep) * (1 - 0.7 * clo)
-        tBand = 0.06 + 0.1 * dep
+        tBand = 0.05 + 0.1 * dep
         tIg = tl.at(tl.ig, t).toDouble()
         tRb = SP_BED * 0.55 * (0.5 + 0.5 * inten) * (1 - 0.4 * clo)
         tHb = SP_BED * 0.5 * (0.35 + 0.65 * max(0.6 * inten, pulse))
@@ -294,9 +335,9 @@ internal class SpStage(sr: Int) {
         } else {
             val ti = tl.at(tl.ti, t).toDouble()
             val wd = tl.at(tl.wd, t).toDouble()
-            azV = slew(azV, tl.at(tl.az, t).toDouble())
-            azL = slew(azL, ti - wd)
-            azR = slew(azR, ti + wd)
+            azV = slewAng(azV, tl.at(tl.az, t).toDouble())
+            azL = slewAng(azL, ti - wd)
+            azR = slewAng(azR, ti + wd)
         }
         voice.aim(azV, 0.0)
         bandL.aim(azL, el)
@@ -331,8 +372,25 @@ internal class SpStage(sr: Int) {
         var wl = voice.outL * dry + vs * cl
         var wr = voice.outR * dry + vs * cl
 
-        bandL.process(xl * ig)
-        bandR.process(xr * ig)
+        // The rear and overhead layers take their share OUT of the front band (never a second copy of it), so the tone
+        // stays clean: rear gets part of the side signal, overhead gets only its highs.
+        var fl = xl
+        var fr = xr
+        if (rb > 1e-4 || hb > 1e-4) {
+            val cc = (xl + xr) * 0.5
+            val ss = (xl - xr) * 0.5
+            val sh = sHp2.run(sHp1.run(ss, 0), 0)
+            fl = cc + ss - ss * rb - sh * hb
+            fr = cc - ss + ss * rb + sh * hb
+            rearL.process(ss * rb)
+            rearR.process(-ss * rb)
+            highL.process(sh * hb)
+            highR.process(-sh * hb)
+            wl += rearL.outL + rearR.outL + highL.outL + highR.outL
+            wr += rearL.outR + rearR.outR + highL.outR + highR.outR
+        }
+        bandL.process(fl * ig)
+        bandR.process(fr * ig)
         wl += bandL.outL + bandR.outL
         wr += bandL.outR + bandR.outR
 
@@ -341,22 +399,16 @@ internal class SpStage(sr: Int) {
         wl += echo.outL + 0.3 * rev.outL
         wr += echo.outR + 0.3 * rev.outR
 
-        val side = (xl - xr) * 0.5
-        if (rb > 1e-4 || hb > 1e-4) {
-            rearL.process(-side * rb)
-            rearR.process(side * rb)
-            highL.process(side * hb)
-            highR.process(-side * hb)
-            wl += rearL.outL + rearR.outL + highL.outL + highR.outL
-            wr += rearL.outR + rearR.outR + highL.outR + highR.outR
-        }
-
-        // Level match: the spatial version sits at the loudness of the plain signal it replaces, so the effect is judged
-        // on its placement, never on a level drop. Slow envelopes, so it never pumps with the music.
+        // Level match: the spatial version sits at the loudness of the plain signal it replaces and its peaks never get
+        // past the plain signal's, so the limiter is not pushed and the effect is judged on placement, not on a level change.
         pIn += ((l * l + r * r) * 0.5 - pIn) * kEnv
         pOut += ((wl * wl + wr * wr) * 0.5 - pOut) * kEnv
-        val want = sqrt((pIn + 1e-10) / (pOut + 1e-10)).coerceIn(0.5, 2.5)
-        match += (want - match) * kMatch
+        pkIn = max(max(abs(l), abs(r)), pkIn * pkRel)
+        pkOut = max(max(abs(wl), abs(wr)), pkOut * pkRel)
+        val rmsWant = sqrt((pIn + 1e-10) / (pOut + 1e-10))
+        val pkWant = (pkIn + 1e-4) / (pkOut + 1e-4)
+        val want = min(rmsWant, pkWant).coerceIn(0.4, 1.25)
+        match += (want - match) * (if (want < match) kDown else kUp)
         outL = l * (1 - mix) + wl * match * mix
         outR = r * (1 - mix) + wr * match * mix
     }
@@ -411,13 +463,21 @@ private fun spZeroPhase(a: FloatArray, tau: Double) {
     }
 }
 
-/** Per-hop features of one song, and the timeline built from them. */
-private class SpFeatures(private val sr: Int) {
-    private val d = sr.toDouble()
-    private val h = max(1, (sr * SpTimeline.HOP).roundToInt())
+/**
+ * Per-hop features of one song, and the timeline built from them. The audio is averaged down 3-4x first (the bands we
+ * follow are all below 3.5 kHz), which makes the whole analysis several times faster.
+ */
+internal class SpFeatures(private val sr: Int) {
+    private val h0 = max(1, (sr * SpTimeline.HOP).roundToInt())
+    private val dec = listOf(4, 3, 2).firstOrNull { h0 % it == 0 } ?: 1
+    private val d = sr.toDouble() / dec
+    private val h = h0 / dec
     private val hp = Biquad().highPass(250.0, 0.707, d)
     private val lp = Biquad().lowPass(3500.0, 0.707, d)
     private val bass = Biquad().lowPass(120.0, 0.707, d)
+    private var dn = 0
+    private var ai = 0.0
+    private var bi = 0.0
     private var cnt = 0
     private var acc = 0.0
     private var tot = 0.0
@@ -436,7 +496,16 @@ private class SpFeatures(private val sr: Int) {
 
     val rate: Int get() = sr
 
-    fun push(l: Double, r: Double) {
+    fun push(l0: Double, r0: Double) {
+        frames++
+        ai += l0
+        bi += r0
+        if (++dn < dec) return
+        val l = ai / dec
+        val r = bi / dec
+        ai = 0.0
+        bi = 0.0
+        dn = 0
         val m = (l + r) * 0.5
         val x = lp.run(hp.run(m, 0), 0)
         val y = bass.run(m, 0)
@@ -448,7 +517,6 @@ private class SpFeatures(private val sr: Int) {
         rr += r * r
         ss += (l - r) * (l - r) * 0.25
         mm += m * m
-        frames++
         if (++cnt == h) {
             svL.add((10 * log10(acc / h + 1e-9)).toFloat())
             stL.add((10 * log10(tot / h / 2 + 1e-9)).toFloat())
@@ -460,13 +528,14 @@ private class SpFeatures(private val sr: Int) {
         }
     }
 
+    /** Builds the timeline for everything pushed so far (so it can be called early for a first version, and again at the end). */
     fun timeline(): SpTimeline? {
         val n = svL.size
         if (n < 60) return null
         val sv = svL.array()
         val st = stL.array()
         val eb = ebL.array()
-        val hop = h.toDouble() / sr
+        val hop = h0.toDouble() / sr
 
         // Smooth: fast attack, slow release, so a line reads as one event rather than a cloud of jitter.
         var s = sv[0]
@@ -624,16 +693,16 @@ private class SpFeatures(private val sr: Int) {
                 val tg = p.s + j * stp
                 val i0 = max(8, ((tg - 0.3 * stp) / hop).toInt())
                 val i1 = min(n - 9, ((tg + 0.3 * stp) / hop).toInt())
-                var bi = i0
+                var bi2 = i0
                 var bv = -99.0
                 for (q in i0..i1) {
                     val z = notch(q)
                     if (z > bv) {
                         bv = z
-                        bi = q
+                        bi2 = q
                     }
                 }
-                val cut = bi * hop
+                val cut = bi2 * hop
                 if (bv >= 2 && cut - t1 >= 3 && p.e - cut >= 2) {
                     phrases.add(p.piece(t1, cut))
                     t1 = cut
@@ -701,7 +770,7 @@ private class SpFeatures(private val sr: Int) {
             cx = g0 + (g1 - g0) * u * u * u * (u * (u * 6 - 15) + 10)
             az[i] = cx.toFloat()
             val p = if (np > 0) phrases[kk] else null
-            dep[i] = min(0.95, 0.3 + 0.75 * (p?.f ?: 0f)).toFloat()
+            dep[i] = min(0.95, 0.2 + 0.75 * (p?.f ?: 0f)).toFloat()
             clo[i] = if (p?.kind == 1) 1f else 0f
         }
         spZeroPhase(dep, 0.25)
@@ -719,9 +788,9 @@ private class SpFeatures(private val sr: Int) {
             val cl = clo[i].toDouble()
             val iz = inten[i].toDouble()
             val pz = pu[i].toDouble()
-            ang += 360 * (0.04 + 0.26 * iz * 0.88) * (1 + 0.8 * pz) * (1 - 0.5 * cl) * SpTimeline.HOP
+            ang += 360 * (0.04 + 0.2 * iz) * (1 + 0.5 * pz) * (1 - 0.5 * cl) * SpTimeline.HOP
             ti[i] = ang.toFloat()
-            wd[i] = ((38 * (0.6 + 0.4 * iz) + 10 * pz) * (1 - 0.5 * cl) + 14 * max(0.0, dep[i] - 0.3)).toFloat()
+            wd[i] = ((30 * (0.6 + 0.4 * iz) + 8 * pz) * (1 - 0.5 * cl) + 14 * max(0.0, dep[i] - 0.3)).toFloat()
             hg[i] = (0.2 * (0.2 + 0.8 * iz)).toFloat()
             ig[i] = (1 - 0.16 * cl).toFloat()
             if (dual) {
@@ -738,7 +807,10 @@ private object SpAnalyzer {
     /** Longer than this: skipped (podcasts and long mixes are not worth the wait or the battery). */
     private const val MAX_SECONDS = 2400.0
 
-    fun build(ctx: Context, uri: Uri): SpTimeline? {
+    /** The first stretch is published as soon as it is decoded, so the real timeline takes over within about a second. */
+    private const val PARTIAL_SECONDS = 45.0
+
+    fun build(ctx: Context, uri: Uri, onPartial: (SpTimeline) -> Unit): SpTimeline? {
         val ex = MediaExtractor()
         var codec: MediaCodec? = null
         try {
@@ -763,9 +835,10 @@ private object SpAnalyzer {
             var flt = false
             var inEos = false
             var outEos = false
+            var partial = false
             while (!outEos) {
                 if (!inEos) {
-                    val ii = c.dequeueInputBuffer(10_000)
+                    val ii = c.dequeueInputBuffer(5_000)
                     if (ii >= 0) {
                         val ib = c.getInputBuffer(ii)!!
                         val size = ex.readSampleData(ib, 0)
@@ -778,7 +851,7 @@ private object SpAnalyzer {
                         }
                     }
                 }
-                val oi = c.dequeueOutputBuffer(info, 10_000)
+                val oi = c.dequeueOutputBuffer(info, 5_000)
                 if (oi == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     val of = c.outputFormat
                     ch = of.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
@@ -792,6 +865,10 @@ private object SpAnalyzer {
                         if (f.frames > MAX_SECONDS * f.rate) {
                             c.releaseOutputBuffer(oi, false)
                             return null
+                        }
+                        if (!partial && f.frames > PARTIAL_SECONDS * f.rate) {
+                            partial = true
+                            f.timeline()?.let(onPartial)
                         }
                     }
                     c.releaseOutputBuffer(oi, false)
@@ -837,26 +914,35 @@ private object SpAnalyzer {
 }
 
 /**
- * Main-thread glue. Works out which DSP belongs to which player (the main one and the crossfade standby), gives each song
- * its timeline once it has been analysed, re-anchors the sample clock on every track change and seek, and keeps the
- * immersive / auto flags of each chain in step with the settings.
+ * Main-thread glue. Keeps each chain's immersive / auto flags in step with the settings, tells it which song the player
+ * thinks it is on (a fallback; the stream metadata is the primary source), asks for songs to be analysed (the current one
+ * urgently, the next one lazily), and re-anchors a clock that has drifted far from the player's.
  */
 internal object SpatialHub {
     private val main = Handler(Looper.getMainLooper())
-    private val pool = Executors.newSingleThreadExecutor { r ->
+    private val urgentPool = Executors.newSingleThreadExecutor { r ->
         Thread({
-            Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
+            Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT)
             r.run()
         }, "sonora-spatial")
     }
+    private val lazyPool = Executors.newSingleThreadExecutor { r ->
+        Thread({
+            Process.setThreadPriority(Process.THREAD_PRIORITY_LESS_FAVORABLE)
+            r.run()
+        }, "sonora-spatial-next")
+    }
     private val cache = object : LinkedHashMap<String, SpTimeline>(8, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, SpTimeline>?): Boolean = size > 8
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, SpTimeline>?): Boolean {
+            val drop = size > 8
+            if (drop && eldest != null) SpStore.map.remove(eldest.key)
+            return drop
+        }
     }
     private val pending = HashSet<String>()
     private val failed = HashSet<String>()
-    private val dspOf = HashMap<ExoPlayer, SonoraDsp>()
-    private val idOf = HashMap<ExoPlayer, String?>()
     private val syncOf = HashMap<ExoPlayer, Player.Listener>()
+    private val bad = HashMap<ExoPlayer, Int>()
     private val tick = object : Runnable {
         override fun run() {
             refresh()
@@ -872,8 +958,7 @@ internal object SpatialHub {
     fun stop() {
         main.removeCallbacks(tick)
         syncOf.clear()
-        dspOf.clear()
-        idOf.clear()
+        bad.clear()
         pending.clear()
     }
 
@@ -897,68 +982,75 @@ internal object SpatialHub {
 
     private fun bind(p: ExoPlayer, dsp: SonoraDsp) {
         if (syncOf[p] == null) {
-            val l = Sync(p)
+            val l = object : Player.Listener {
+                override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                    refresh()
+                }
+            }
             syncOf[p] = l
             p.addListener(l)
         }
-        val fresh = dspOf.put(p, dsp) == null
         val item = p.currentMediaItem
-        val id = item?.mediaId
-        if (fresh || idOf[p] != id) {
-            idOf[p] = id
-            dsp.spAnchor = SpAnchor(p.currentPosition / 1000.0, dsp.sampleFrames)
+        val id = item?.mediaId?.takeIf { it.isNotEmpty() }
+        dsp.spHint = id
+        if (id != null && item != null && dsp.params.orbit) {
+            if (!SpStore.map.containsKey(id)) request(item, true)
+            val ni = p.nextMediaItemIndex
+            if (ni != C.INDEX_UNSET) request(p.getMediaItemAt(ni), false)
         }
-        if (id == null) {
-            dsp.spTimeline = null
+        checkClock(p, dsp)
+    }
+
+    /**
+     * The clock is normally exact (set at every flush). This only catches a clock that is far from the player's, for
+     * example if a flush ever arrived without a usable position: three bad readings in a row re-anchor it.
+     */
+    private fun checkClock(p: ExoPlayer, dsp: SonoraDsp) {
+        if (!p.isPlaying) {
+            bad[p] = 0
             return
         }
-        val tl = cache[id]
-        dsp.spTimeline = tl
-        if (dsp.params.orbit) {
-            if (tl == null && item != null) request(item)
-            val ni = p.nextMediaItemIndex
-            if (ni != C.INDEX_UNSET) request(p.getMediaItemAt(ni))
+        val an = dsp.spAnchor
+        val est = an.base + (dsp.sampleFrames - an.origin) / dsp.sampleRate.toDouble()
+        val diff = est - p.currentPosition / 1000.0
+        if (diff < -0.6 || diff > 3.0) {
+            val n = (bad[p] ?: 0) + 1
+            if (n >= 3) {
+                dsp.spAnchor = SpAnchor(p.currentPosition / 1000.0 + 0.3, dsp.sampleFrames)
+                bad[p] = 0
+            } else {
+                bad[p] = n
+            }
+        } else {
+            bad[p] = 0
         }
     }
 
-    private fun request(item: MediaItem) {
+    private fun publish(id: String, tl: SpTimeline) {
+        cache[id] = tl
+        SpStore.map[id] = tl
+    }
+
+    private fun request(item: MediaItem, urgent: Boolean) {
         val id = item.mediaId
         val uri = item.localConfiguration?.uri ?: return
-        if (id.isEmpty() || cache.containsKey(id) || id in failed || !pending.add(id)) return
+        if (id.isEmpty() || SpStore.map.containsKey(id) || id in failed || !pending.add(id)) return
         val ctx = S.app
-        pool.execute {
+        (if (urgent) urgentPool else lazyPool).execute {
             val tl = try {
-                SpAnalyzer.build(ctx, uri)
+                SpAnalyzer.build(ctx, uri) { part -> main.post { publish(id, part) } }
             } catch (e: Exception) {
                 null
             }
             main.post {
                 pending.remove(id)
                 if (tl != null) {
-                    cache[id] = tl
-                } else {
+                    publish(id, tl)
+                } else if (!SpStore.map.containsKey(id)) {
                     failed.add(id)
                 }
                 refresh()
             }
-        }
-    }
-
-    /** A track changed or the player jumped: the processor's frame counter is now the new position. */
-    private fun resync(p: ExoPlayer, posMs: Long) {
-        val dsp = dspOf[p] ?: return
-        idOf[p] = p.currentMediaItem?.mediaId
-        dsp.spAnchor = SpAnchor(posMs / 1000.0, dsp.sampleFrames)
-        refresh()
-    }
-
-    private class Sync(private val p: ExoPlayer) : Player.Listener {
-        override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-            SpatialHub.resync(p, p.currentPosition)
-        }
-
-        override fun onPositionDiscontinuity(oldPosition: Player.PositionInfo, newPosition: Player.PositionInfo, reason: Int) {
-            SpatialHub.resync(p, newPosition.positionMs)
         }
     }
 }
