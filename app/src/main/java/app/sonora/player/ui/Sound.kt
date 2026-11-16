@@ -176,6 +176,7 @@ fun SoundScreen() {
     val normalized = s.rgMode != "off"
     val cfg = track?.let { user.trackConfigs[it.id] }
     val semis = (12 * log2(s.speed.coerceAtLeast(0.25))).roundToInt()
+    val spatialActive = s.orbit || s.atmos
 
     LazyColumn(contentPadding = PaddingValues(start = 14.dp, end = 14.dp, bottom = 20.dp), verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxSize()) {
         item {
@@ -233,7 +234,7 @@ fun SoundScreen() {
             Panel {
                 CardHead(Ic.Bolt, "PRECISION AUDIO ENGINE", "Advanced DSP & 10-band EQ")
                 Btn(if (advanced) "Hide advanced" else "Open advanced", icon = if (advanced) Ic.Up else Ic.Down, accent = false) { advanced = !advanced }
-                if (!advanced) Text("Fine-tune 10 bands with AutoEQ import, live frequency response curve, 8D spatial orbit, crossfeed, gapless crossfade, and 432Hz / semitone pitch modes.", color = p.muted, fontSize = 12.5.sp, lineHeight = 17.sp, modifier = Modifier.padding(top = 10.dp))
+                if (!advanced) Text("Fine-tune 10 bands with AutoEQ import, live frequency response curve, 8D orbit and immersive surround, crossfeed, gapless crossfade, and 432Hz / semitone pitch modes.", color = p.muted, fontSize = 12.5.sp, lineHeight = 17.sp, modifier = Modifier.padding(top = 10.dp))
                 else {
                     Text("10-Band Equalizer & Live Response", color = p.text, fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 14.dp, bottom = 8.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -270,16 +271,21 @@ fun SoundScreen() {
                     SSlider("Pre-amp headroom", s.preampDb, -15.0, 6.0, 0.5) { v -> set { it.copy(preampDb = v) } }
                     ToggleRow("Auto headroom", "Lowers pre-amp by largest EQ boost to eliminate digital clipping", s.autoPreamp) { on -> set { it.copy(autoPreamp = on) } }
                     Box(Modifier.padding(vertical = 10.dp).fillMaxWidth().height(1.dp).background(p.border))
-                    Text("Spatial Stage & 8D Orbit", color = p.text, fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 8.dp))
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf("normal" to "Stereo", "mono" to "Mono", "vocal" to "Vocal focus", "karaoke" to "Karaoke (no vocals)").forEach { (k, l) -> Chip(l, active = s.stereoMode == k) { set { it.copy(stereoMode = k) } } }
+                    Text("Spatial Stage", color = p.text, fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 8.dp))
+                    ToggleRow("8D Orbit", "Moves the sound around your head, locked to the music. Best on headphones.", s.orbit) { on -> set { it.copy(orbit = on, atmos = if (on) false else it.atmos) } }
+                    ToggleRow("Immersive surround (Atmos-style)", "Centre voice, wide front, rear and overhead ambience. Works instantly, with no analysis.", s.atmos) { on -> set { it.copy(atmos = on, orbit = if (on) false else it.orbit) } }
+                    ToggleRow("Auto spatial tuning", "Sets stereo width, crossfeed and room for the active mode, for best results. Turn off to use your own sliders.", s.spatialAuto) { on -> set { it.copy(spatialAuto = on) } }
+                    if (spatialActive && s.spatialAuto) {
+                        Text("Stereo width, crossfeed and room are set automatically while this is on.", color = p.muted, fontSize = 12.sp, lineHeight = 16.sp, modifier = Modifier.padding(vertical = 6.dp))
+                    } else {
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf("normal" to "Stereo", "mono" to "Mono", "vocal" to "Vocal focus", "karaoke" to "Karaoke (no vocals)").forEach { (k, l) -> Chip(l, active = s.stereoMode == k) { set { it.copy(stereoMode = k) } } }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        SSlider("Stereo width", s.width, 0.0, 2.5, 0.05, ::pct) { v -> set { it.copy(width = v, stereoMode = "normal") } }
+                        SSlider("Headphone crossfeed", s.crossfeed, 0.0, 1.0, 0.05, ::pct) { v -> set { it.copy(crossfeed = v) } }
+                        SSlider("Room ambience", s.room, 0.0, 1.0, 0.05, ::pct) { v -> set { it.copy(room = v) } }
                     }
-                    Spacer(Modifier.height(8.dp))
-                    SSlider("Stereo width", s.width, 0.0, 2.5, 0.05, ::pct) { v -> set { it.copy(width = v, stereoMode = "normal") } }
-                    SSlider("Headphone crossfeed", s.crossfeed, 0.0, 1.0, 0.05, ::pct) { v -> set { it.copy(crossfeed = v) } }
-                    SSlider("Room ambience", s.room, 0.0, 1.0, 0.05, ::pct) { v -> set { it.copy(room = v) } }
-                    ToggleRow("8D Orbit", "Pans the sound slowly around your head (best on headphones)", s.orbit) { on -> set { it.copy(orbit = on) } }
-                    if (s.orbit) SSlider("Orbit speed", s.orbitSpeed, 0.03, 0.6, 0.01, { "${"%.1f".format(1 / it)}s / rev" }) { v -> set { it.copy(orbitSpeed = v) } }
                     Box(Modifier.padding(vertical = 10.dp).fillMaxWidth().height(1.dp).background(p.border))
                     Text("Transitions, ReplayGain & Speed/Pitch", color = p.text, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                     ToggleRow("Gapless playback", "Pre-buffers the next track for zero-gap transitions", s.gapless) { on -> set { it.copy(gapless = on) } }

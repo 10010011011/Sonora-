@@ -31,18 +31,21 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /*
- * Spatial 8D: the automatic engine behind the existing orbit switch. No sliders; it works out the song itself.
+ * Spatial stage: the engine behind 8D orbit and immersive surround. Automatic, no sliders.
  *
- * 1. Pre-scan (background, once per song): energy in the vocal band (250-3500 Hz) is followed over time. Gaps in it cut the
- *    song into musical chunks. Each chunk is judged against its neighbours: louder than its surroundings = impact (centre,
- *    close); a quieter repeat of the line before it = echo (far, behind). Bass hits give a beat pulse; loudness gives intensity.
- * 2. Baked timeline: where each chunk sits (lines alternate sides, glides land exactly as the next line starts and are speed-capped),
- *    how close or far it is, how wide the orbiting band is, plus an Atmos-style rear and overhead bed.
- * 3. Real-time render (audio thread, one stage per player): voice (400-4000 Hz centre) and band (the rest) are placed binaurally,
- *    reverb sends carry the distance. The audio thread only reads the finished timeline; it never analyses or allocates.
+ * 1. Pre-scan (background, once per song, 8D only): energy in the vocal band (250-3500 Hz) is followed over time. Gaps in it
+ *    cut the song into musical chunks. Each chunk is judged against its neighbours: louder = impact (centre, close); a quieter
+ *    repeat of the line before it = echo (far, behind). Bass hits give a beat pulse; loudness gives intensity.
+ * 2. Timeline: where each chunk sits (lines alternate sides, glides land as the next line starts, speed-capped), how close
+ *    or far it is, how wide the orbiting band is, plus the rear and overhead bed. Until the song is analysed, 8D uses a steady
+ *    generic swing, so there is never silence while the analysis runs.
+ * 3. Real-time render (audio thread, one stage per player): voice (400-4000 Hz centre) and band (the rest) are placed
+ *    binaurally, reverb sends carry the distance, and the spatial part is levelled to the loudness of the plain signal.
+ *    Immersive surround uses the same renderer with a fixed front stage and no analysis at all.
+ * The audio thread only reads targets; it never analyses or allocates.
  */
 
-/** Level of the Atmos-style rear and overhead ambience. */
+/** Level of the rear and overhead ambience. */
 private const val SP_BED = 0.6
 
 /** How far the voice swings from the centre, as a share of the full move. */
@@ -54,7 +57,6 @@ internal class SpAnchor(val base: Double, val origin: Long)
 /** The whole-song automation, sampled every 20 ms. Built once in the background, read by the audio thread. */
 internal class SpTimeline(
     val dual: Boolean,
-    val trim: Double,
     val az: FloatArray,
     val dep: FloatArray,
     val clo: FloatArray,
@@ -132,10 +134,10 @@ private class SpBinaural(private val sr: Double) {
         val s = (sin(a) * cos(e)).coerceIn(-1.0, 1.0)
         tL = half * (1 + s)
         tR = half * (1 - s)
-        val far = 10.0.pow(-6.0 * abs(s) / 20)
+        val far = 10.0.pow(-9.0 * abs(s) / 20)
         tgL = if (s > 0) far else 1.0
         tgR = if (s < 0) far else 1.0
-        val cut = max(4000.0, top - 10000.0 * abs(s))
+        val cut = max(3500.0, top - 12000.0 * abs(s))
         shL.lowPass(if (s > 0) cut else top, 0.707, sr)
         shR.lowPass(if (s < 0) cut else top, 0.707, sr)
         val back = max(0.0, -cos(a)) * cos(e)
@@ -160,6 +162,8 @@ private class SpBinaural(private val sr: Double) {
 internal class SpStage(sr: Int) {
     private val d = sr.toDouble()
     private val kg = 1 - exp(-1 / (0.02 * d))
+    private val kEnv = 1 - exp(-1 / (0.8 * d)) // level envelopes, about 0.8 s
+    private val kMatch = 1 - exp(-1 / (0.3 * d))
     private val slewStep = 700.0 * 32 / d // at most 700 degrees per second
     private fun cut(f: Double) = min(f, 0.45 * d)
 
@@ -167,7 +171,7 @@ internal class SpStage(sr: Int) {
     private val vHp2 = Biquad().highPass(400.0, 0.707, d)
     private val vLp1 = Biquad().lowPass(cut(4000.0), 0.707, d)
     private val vLp2 = Biquad().lowPass(cut(4000.0), 0.707, d)
-    private val vDark = Biquad().lowPass(cut(16000.0), 0.707, d)
+    private val vDark = Biquad().lowPass(cut(12000.0), 0.707, d)
     private val bandHp = Biquad().highPass(1200.0, 0.707, d)
     private val voice = SpBinaural(d)
     private val bandL = SpBinaural(d)
@@ -196,34 +200,79 @@ internal class SpStage(sr: Int) {
     private var rb = 0.0
     private var tHb = 0.0
     private var hb = 0.0
-    private var tTrim = 1.0
-    private var trim = 1.0
     private var azV = 0.0
     private var azL = -85.0
     private var azR = 85.0
+    private var pIn = 1e-6
+    private var pOut = 1e-6
+    private var match = 1.0
     var outL = 0.0
     var outR = 0.0
 
     init {
-        rearL.aim(-130.0, 0.0)
-        rearR.aim(130.0, 0.0)
-        highL.aim(-40.0, 50.0)
-        highR.aim(40.0, 50.0)
-        echo.aim(180.0, 12.0)
+        rearL.aim(-115.0, 0.0)
+        rearR.aim(115.0, 0.0)
+        highL.aim(-45.0, 35.0)
+        highR.aim(45.0, 35.0)
+        echo.aim(180.0, 10.0)
     }
 
     fun busy(): Boolean = mixT > 0.0 || mix > 0.001
 
     private fun slew(c: Double, target: Double): Double = c + (target - c).coerceIn(-slewStep, slewStep)
 
-    /** Called once per 32 frames. fAbs = absolute frame index of the first frame of the block. */
-    fun block(tl: SpTimeline?, an: SpAnchor, fAbs: Long, on: Boolean) {
-        if (!on || tl == null) {
+    /** Once per 32 frames. m: 0 off, 1 8D orbit, 2 immersive surround. fAbs = absolute frame index of the block start. */
+    fun block(tl: SpTimeline?, an: SpAnchor, fAbs: Long, m: Int) {
+        if (m == 0) {
             mixT = 0.0
             return
         }
         mixT = 1.0
         val t = max(0.0, an.base + (fAbs - an.origin) / d)
+        when {
+            m == 2 -> immersiveTargets()
+            tl != null -> timelineTargets(tl, t)
+            else -> genericTargets(t)
+        }
+    }
+
+    /** Immersive: fixed front stage (centre voice, wide band) and rear and overhead ambience from the side signal. */
+    private fun immersiveTargets() {
+        dual = false
+        tDry = 1.0
+        tCl = 0.3
+        tSend = 0.16
+        tBand = 0.10
+        tIg = 1.0
+        tRb = SP_BED * 0.5
+        tHb = SP_BED * 0.3
+        vDark.lowPass(cut(12000.0), 0.707, d)
+        voice.aim(0.0, 0.0)
+        bandL.aim(-30.0, 0.0)
+        bandR.aim(30.0, 0.0)
+    }
+
+    /** 8D before the song is analysed: a steady swing, so there is never silence while the timeline is prepared. */
+    private fun genericTargets(t: Double) {
+        dual = false
+        tDry = 0.78
+        tCl = 0.0
+        tSend = 0.27
+        tBand = 0.085
+        tIg = 1.0
+        tRb = SP_BED * 0.55 * 0.75
+        tHb = SP_BED * 0.5 * 0.67
+        vDark.lowPass(cut(12000.0), 0.707, d)
+        azV = slew(azV, 70 * sin(2 * PI * t / 10.0))
+        azL = slew(azL, 360 * 0.03 * t - 40)
+        azR = slew(azR, 360 * 0.03 * t + 40)
+        voice.aim(azV, 0.0)
+        bandL.aim(azL, 0.0)
+        bandR.aim(azR, 0.0)
+    }
+
+    /** 8D with the analysed timeline: lines, impacts, echoes, beats and the orbit. */
+    private fun timelineTargets(tl: SpTimeline, t: Double) {
         val dep = tl.at(tl.dep, t).toDouble()
         val clo = tl.at(tl.clo, t).toDouble()
         val inten = tl.at(tl.inten, t).toDouble()
@@ -236,7 +285,6 @@ internal class SpStage(sr: Int) {
         tIg = tl.at(tl.ig, t).toDouble()
         tRb = SP_BED * 0.55 * (0.5 + 0.5 * inten) * (1 - 0.4 * clo)
         tHb = SP_BED * 0.5 * (0.35 + 0.65 * max(0.6 * inten, pulse))
-        tTrim = tl.trim
         vDark.lowPass(cut(16000.0 * 0.2.pow(dep)), 0.707, d)
         dual = tl.dual
         val el = atan(tl.at(tl.hg, t).toDouble()) * 180 / PI
@@ -271,7 +319,6 @@ internal class SpStage(sr: Int) {
         ig += (tIg - ig) * kg
         rb += (tRb - rb) * kg
         hb += (tHb - hb) * kg
-        trim += (tTrim - trim) * kg
 
         val m = (l + r) * 0.5
         var v = 0.0
@@ -303,8 +350,15 @@ internal class SpStage(sr: Int) {
             wl += rearL.outL + rearR.outL + highL.outL + highR.outL
             wr += rearL.outR + rearR.outR + highL.outR + highR.outR
         }
-        outL = l * (1 - mix) + wl * trim * mix
-        outR = r * (1 - mix) + wr * trim * mix
+
+        // Level match: the spatial version sits at the loudness of the plain signal it replaces, so the effect is judged
+        // on its placement, never on a level drop. Slow envelopes, so it never pumps with the music.
+        pIn += ((l * l + r * r) * 0.5 - pIn) * kEnv
+        pOut += ((wl * wl + wr * wr) * 0.5 - pOut) * kEnv
+        val want = sqrt((pIn + 1e-10) / (pOut + 1e-10)).coerceIn(0.5, 2.5)
+        match += (want - match) * kMatch
+        outL = l * (1 - mix) + wl * match * mix
+        outR = r * (1 - mix) + wr * match * mix
     }
 }
 
@@ -431,7 +485,6 @@ private class SpFeatures(private val sr: Int) {
         val lo = svSorted[(n * 0.1).toInt()]
         val tl = stSorted[(n * 0.2).toInt()]
         val th = stSorted[(n * 0.95).toInt()]
-        val p90 = stSorted[(n * 0.9).toInt()]
         var mu = 0.0
         for (x in sv) mu += x
         mu /= n
@@ -591,8 +644,8 @@ private class SpFeatures(private val sr: Int) {
 
         // 6. Bake the glides: lines alternate sides, impacts centre, echoes behind; every glide lands as its line starts.
         val np = phrases.size
-        val am = if (narrow) 55.0 else 85.0
-        val af = if (narrow) 45.0 else 62.0
+        val am = if (narrow) 62.0 else 100.0
+        val af = if (narrow) 50.0 else 78.0
         val tgt = DoubleArray(np)
         val fl2 = DoubleArray(np)
         val tt = DoubleArray(np)
@@ -611,7 +664,7 @@ private class SpFeatures(private val sr: Int) {
             } else if (p.kind == 1) {
                 0.0
             } else {
-                180.0 + (if (c % 2 == 1) -30.0 else 30.0)
+                180.0 + (if (c % 2 == 1) -40.0 else 40.0)
             }
             var dd = ((aim - x) % 360 + 360) % 360
             if (!(SP_VOICE_MOVE < 0.3 && pn && nk && !fast) && dd > 180) dd -= 360
@@ -648,7 +701,7 @@ private class SpFeatures(private val sr: Int) {
             cx = g0 + (g1 - g0) * u * u * u * (u * (u * 6 - 15) + 10)
             az[i] = cx.toFloat()
             val p = if (np > 0) phrases[kk] else null
-            dep[i] = min(0.95, 0.215 + 0.75 * (p?.f ?: 0f)).toFloat()
+            dep[i] = min(0.95, 0.3 + 0.75 * (p?.f ?: 0f)).toFloat()
             clo[i] = if (p?.kind == 1) 1f else 0f
         }
         spZeroPhase(dep, 0.25)
@@ -666,9 +719,9 @@ private class SpFeatures(private val sr: Int) {
             val cl = clo[i].toDouble()
             val iz = inten[i].toDouble()
             val pz = pu[i].toDouble()
-            ang += 360 * (0.03 + 0.2 * iz * 0.88) * (1 + 0.8 * pz) * (1 - 0.5 * cl) * SpTimeline.HOP
+            ang += 360 * (0.04 + 0.26 * iz * 0.88) * (1 + 0.8 * pz) * (1 - 0.5 * cl) * SpTimeline.HOP
             ti[i] = ang.toFloat()
-            wd[i] = ((30 * (0.6 + 0.4 * iz) + 10 * pz) * (1 - 0.5 * cl) + 14 * max(0.0, dep[i] - 0.3)).toFloat()
+            wd[i] = ((38 * (0.6 + 0.4 * iz) + 10 * pz) * (1 - 0.5 * cl) + 14 * max(0.0, dep[i] - 0.3)).toFloat()
             hg[i] = (0.2 * (0.2 + 0.8 * iz)).toFloat()
             ig[i] = (1 - 0.16 * cl).toFloat()
             if (dual) {
@@ -676,8 +729,7 @@ private class SpFeatures(private val sr: Int) {
                 wd[i] = (80 + 8 * sin(i * SpTimeline.HOP * 0.3)).toFloat()
             }
         }
-        val trim = min(0.75, 0.75 * 10.0.pow(min(0.0, -11.8 - p90) / 20))
-        return SpTimeline(dual, trim, az, dep, clo, ti, wd, hg, ig, inten, pu)
+        return SpTimeline(dual, az, dep, clo, ti, wd, hg, ig, inten, pu)
     }
 }
 
@@ -786,7 +838,8 @@ private object SpAnalyzer {
 
 /**
  * Main-thread glue. Works out which DSP belongs to which player (the main one and the crossfade standby), gives each song
- * its timeline once it has been analysed, and re-anchors the sample clock on every track change and seek.
+ * its timeline once it has been analysed, re-anchors the sample clock on every track change and seek, and keeps the
+ * immersive / auto flags of each chain in step with the settings.
  */
 internal object SpatialHub {
     private val main = Handler(Looper.getMainLooper())
@@ -825,6 +878,11 @@ internal object SpatialHub {
     }
 
     private fun refresh() {
+        val s = S.settings.value
+        for (dsp in arrayOf(Engine.dspA, Engine.dspB)) {
+            dsp.spAtmos = s.atmos && !s.orbit
+            dsp.spAuto = s.spatialAuto
+        }
         var any = false
         Engine.forEachPlayer { any = true }
         if (!any) return

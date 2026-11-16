@@ -134,7 +134,8 @@ internal class Reverb(sr: Int) {
 /**
  * Sonora's signal chain as a Media3 AudioProcessor (the native counterpart of the WebAudio graph):
  * ReplayGain x pre-amp -> bass shelf -> 10-band EQ -> treble shelf -> mid/side stage (mono / vocal focus / karaoke / width)
- * -> crossfeed -> spatial 8D (automatic, song-aware) -> room ambience -> boost -> brick-wall limiter. Also feeds the visualisers and meters.
+ * -> crossfeed -> spatial stage (8D orbit or immersive surround, automatic) -> room ambience -> boost -> brick-wall limiter.
+ * Also feeds the visualisers and meters.
  */
 class SonoraDsp : BaseAudioProcessor() {
     @Volatile var params = DspParams()
@@ -150,11 +151,17 @@ class SonoraDsp : BaseAudioProcessor() {
     /** Frames that have passed through this chain since the player was built. The spatial timeline is read against it. */
     @Volatile var sampleFrames = 0L
 
-    /** The analysed timeline of the song this chain is playing. Set by [SpatialHub] on the main thread; null = no effect yet. */
+    /** The analysed timeline of the song this chain is playing. Set by [SpatialHub] on the main thread; null = generic motion. */
     @Volatile internal var spTimeline: SpTimeline? = null
 
     /** Maps [sampleFrames] to media time. Always replaced as a whole, so the audio thread never reads a half-written pair. */
     @Volatile internal var spAnchor = SpAnchor(0.0, 0L)
+
+    /** Immersive (Atmos-style) surround, set by [SpatialHub] from settings. Exclusive with the 8D orbit. */
+    @Volatile var spAtmos = false
+
+    /** Auto: the spatial stage owns stereo width, crossfeed and room while 8D or immersive is on. */
+    @Volatile var spAuto = true
 
     val tapL = FloatArray(TAP)
     val tapR = FloatArray(TAP)
@@ -234,14 +241,19 @@ class SonoraDsp : BaseAudioProcessor() {
         val stereo = ch == 2
         val frames = n / (2 * ch)
         val base = sampleFrames
+        // 0 off, 1 8D orbit, 2 immersive surround. Mono never gets the spatial stage.
+        val spMode = if (!stereo) 0 else if (spAtmos) 2 else if (spatialOn) 1 else 0
+        // Auto: the spatial stage owns stereo width, crossfeed and room, so the user's sliders for those are ignored.
+        val auto = spAuto && spMode != 0
+        val roomTarget = if (auto) 0.0 else roomT
         var pos = inputBuffer.position()
         var tp = tapPos
         var minG = 1.0
         val filters = active
         val tap = tapOn
         // Effects that are still fading out keep the limiter in the path until they are silent.
-        val limiter = limiterOn || (p.limiter && (stage.busy() || roomMix > 0.001))
-        if (!limiter && filters.isEmpty() && !spatial && !spatialOn && !stage.busy() && roomT == 0.0 && roomMix <= 0.001 &&
+        val limiter = limiterOn || (p.limiter && (spMode != 0 || stage.busy() || roomMix > 0.001))
+        if (!limiter && filters.isEmpty() && !spatial && spMode == 0 && !stage.busy() && roomTarget == 0.0 && roomMix <= 0.001 &&
             abs(gPreT - 1) < 1e-4 && abs(gPre - 1) < 2e-3 && abs(gBoostT - 1) < 1e-4 && abs(gBoost - 1) < 2e-3
         ) {
             // Nothing is switched on: pass the samples through untouched (bit-perfect), at almost no CPU cost.
@@ -264,8 +276,8 @@ class SonoraDsp : BaseAudioProcessor() {
         }
         if (!limiter) limG = 1.0
         for (f in 0 until frames) {
-            // Once per 32 frames: pick the song's automation for this moment (cheap; the audio thread only reads).
-            if ((f and 31) == 0) stage.block(spTimeline, spAnchor, base + f, spatialOn && stereo)
+            // Once per 32 frames: pick the spatial targets for this moment (cheap; the audio thread only reads).
+            if ((f and 31) == 0) stage.block(spTimeline, spAnchor, base + f, spMode)
             var l = inputBuffer.getShort(pos) / 32768.0
             var r = if (stereo) inputBuffer.getShort(pos + 2) / 32768.0 else l
             pos += 2 * ch
@@ -277,7 +289,7 @@ class SonoraDsp : BaseAudioProcessor() {
             }
             if (!stereo) r = l
             if (stereo) {
-                if (spatial) {
+                if (spatial && !auto) {
                     side += (sideT - side) * 0.0015
                     val m = (l + r) * 0.5
                     val s = (l - r) * 0.5
@@ -295,12 +307,12 @@ class SonoraDsp : BaseAudioProcessor() {
                         l = (l + cfG * rl) * nrm; r = (r + cfG * ll) * nrm
                     }
                 }
-                if (spatialOn || stage.busy()) {
+                if (spMode != 0 || stage.busy()) {
                     stage.process(l, r)
                     l = stage.outL
                     r = stage.outR
                 }
-                roomMix += (roomT - roomMix) * 0.0004
+                roomMix += (roomTarget - roomMix) * 0.0004
                 if (roomMix > 0.001) {
                     val rv = reverb ?: Reverb(sampleRate).also { reverb = it }
                     rv.process(l + r)

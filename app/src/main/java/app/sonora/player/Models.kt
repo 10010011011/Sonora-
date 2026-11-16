@@ -72,6 +72,10 @@ data class Settings(
     val crossfeed: Double = 0.0,
     val orbit: Boolean = false,
     val orbitSpeed: Double = 0.12,
+    /** Immersive surround (Atmos-style): centre voice, wide front, rear and overhead ambience. Works without analysis. */
+    val atmos: Boolean = false,
+    /** While 8D or immersive is on, the engine sets stereo width, crossfeed and room itself. */
+    val spatialAuto: Boolean = true,
     val room: Double = 0.0,
     val rgMode: String = "track",
     val rgPreamp: Double = 0.0,
