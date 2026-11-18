@@ -1,11 +1,15 @@
 package app.sonora.player
 
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
+import androidx.activity.result.contract.ActivityResultContract
 import androidx.documentfile.provider.DocumentFile
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Metadata
@@ -20,7 +24,10 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
 import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import kotlin.math.max
@@ -93,9 +100,32 @@ object Tags {
 }
 
 /**
- * Brings music into the library. A picked file is copied once into Sonora's storage and recognised by its
- * content fingerprint if it is added again (even renamed). A granted folder is indexed in place (no copy).
- * Sidecar .lrc / .srt / .vtt files are paired with the song of the same name.
+ * The multi-file picker, asking Android to keep read access to each file. Songs picked this way can stay where they are
+ * instead of being copied into Sonora. If Android does not grant lasting access, the importer copies the file as before.
+ */
+class PersistableOpenMultipleDocuments : ActivityResultContract<Array<String>, List<Uri>>() {
+    override fun createIntent(context: Context, input: Array<String>): Intent =
+        Intent(Intent.ACTION_OPEN_DOCUMENT)
+            .setType("*/*")
+            .putExtra(Intent.EXTRA_MIME_TYPES, input)
+            .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+
+    override fun parseResult(resultCode: Int, intent: Intent?): List<Uri> {
+        if (resultCode != Activity.RESULT_OK || intent == null) return emptyList()
+        val out = ArrayList<Uri>()
+        val clip = intent.clipData
+        if (clip != null) for (i in 0 until clip.itemCount) clip.getItemAt(i).uri?.let { out.add(it) }
+        if (out.isEmpty()) intent.data?.let { out.add(it) }
+        return out
+    }
+}
+
+/**
+ * Brings music into the library. By default a picked file that Android lets Sonora keep access to is indexed where it is
+ * (nothing is copied); otherwise it is copied once into Sonora's storage and recognised by its content fingerprint if it is
+ * added again (even renamed). A granted folder is indexed in place (no copy). Sidecar .lrc / .srt / .vtt files are paired
+ * with the song of the same name.
  */
 object Importer {
     private val LYRIC = setOf("lrc", "srt", "vtt")
@@ -225,6 +255,52 @@ object Importer {
         return "$size:" + md.digest().joinToString("") { b -> "%02x".format(b) }
     }
 
+    /** The same fingerprint as [fingerprint], read through the content resolver, for files that stay where they are. */
+    private fun fingerprintUri(uri: Uri, size: Long): String {
+        val n = min(65536L, size).toInt()
+        val head = ByteArray(n)
+        val tail = ByteArray(n)
+        S.app.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+            val ch = FileInputStream(pfd.fileDescriptor).channel
+            readAt(ch, head, 0L)
+            readAt(ch, tail, size - n)
+        } ?: throw IllegalStateException("Could not open the file")
+        val md = MessageDigest.getInstance("SHA-1")
+        md.update(head)
+        md.update(tail)
+        return "$size:" + md.digest().joinToString("") { b -> "%02x".format(b) }
+    }
+
+    private fun readAt(ch: FileChannel, buf: ByteArray, at: Long) {
+        val bb = ByteBuffer.wrap(buf)
+        var pos = at
+        while (bb.hasRemaining()) {
+            val r = ch.read(bb, pos)
+            if (r < 0) throw IllegalStateException("The file ended early")
+            pos += r
+        }
+    }
+
+    /** Asks Android to keep read access to a picked file across restarts. False when it does not: the file is then copied. */
+    private fun keepAccess(uri: Uri): Boolean = runCatching {
+        S.app.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        S.app.contentResolver.persistedUriPermissions.any { it.uri == uri && it.isReadPermission }
+    }.getOrDefault(false)
+
+    private fun releaseAccess(uri: Uri) {
+        runCatching { S.app.contentResolver.releasePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+    }
+
+    /** Gives back access to files that are no longer in the library: Android limits how many a file manager may keep. */
+    private fun pruneAccess() {
+        val keep = HashSet<String>()
+        S.tracks.value.filter { it.storage == "ref" }.forEach { keep.add(it.uri) }
+        S.folders.value.forEach { keep.add(it.uri) }
+        runCatching {
+            S.app.contentResolver.persistedUriPermissions.filter { it.uri.toString() !in keep }.forEach { releaseAccess(it.uri) }
+        }
+    }
+
     private fun readText(uri: Uri): String? = runCatching { S.app.contentResolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) } }.getOrNull()
 
     private fun addTracks(fresh: List<Track>) {
@@ -235,7 +311,7 @@ object Importer {
         S.scope.launch { Engine.requeue() } // the player is main-thread only; imports run on IO
     }
 
-    /** Copies picked audio files (and pairs picked lyric files) into the library. */
+    /** Adds picked audio files (and pairs picked lyric files) to the library: kept where they are when possible, copied otherwise. */
     fun importUris(uris: List<Uri>, kind: String = "import", playFirst: Boolean = false) {
         if (uris.isEmpty()) return
         if (job?.isActive == true) return S.toast("An import is already running")
@@ -245,6 +321,7 @@ object Importer {
             var added = 0
             var skipped = 0
             var lyricsPaired = 0
+            var kept = 0
             val failed = ArrayList<ImportFail>()
             var firstId: String? = null
             withContext(Dispatchers.IO) {
@@ -264,6 +341,52 @@ object Importer {
                     val (uri, ns) = entry
                     val name = ns.first
                     state { it.copy(done = i, name = name) }
+                    val pairedLyric = lyricFiles.firstOrNull { base(it.second.first) == base(name) }
+
+                    // Played where it is: when Android grants lasting access to the file, nothing is copied.
+                    var granted = false
+                    var fpRef: String? = null
+                    if (uri.scheme == "content" && ns.second > 0 && keepAccess(uri)) {
+                        granted = true
+                        fpRef = runCatching { fingerprintUri(uri, ns.second) }.getOrNull()
+                    }
+                    if (fpRef != null) {
+                        try {
+                            val dup = S.tracks.value.firstOrNull { it.fp == fpRef }
+                            if (dup != null) {
+                                skipped++
+                                if (firstId == null) firstId = dup.id
+                                if (pairedLyric != null && runCatching { attachLyric(dup.id, pairedLyric.first, pairedLyric.second.first) }.getOrDefault(false)) lyricsPaired++
+                            } else {
+                                val id = uid()
+                                val e = ext(name).ifEmpty { "audio" }
+                                val meta = readMeta(null, uri, name)
+                                if (meta.duration <= 0 && e !in PLAYABLE_EXTENSIONS) throw IllegalStateException("Not a playable audio file")
+                                val (cover, thumb) = saveCover(id, meta.art)
+                                val extra = Tags.probe(uri)
+                                addTracks(listOf(
+                                    Track(
+                                        id = id, uri = uri.toString(), fileName = name, size = ns.second,
+                                        mime = S.app.contentResolver.getType(uri).orEmpty(), lastModified = System.currentTimeMillis(), path = name,
+                                        title = meta.title, artist = meta.artist, album = meta.album, duration = meta.duration,
+                                        cover = cover, thumb = thumb, rgTrack = extra.rgTrack, rgAlbum = extra.rgAlbum, embeddedLyrics = extra.lyrics,
+                                        addedAt = System.currentTimeMillis(), fp = fpRef, storage = "ref",
+                                    ),
+                                ))
+                                added++
+                                kept++
+                                if (firstId == null) firstId = id
+                                if (pairedLyric != null && runCatching { attachLyric(id, pairedLyric.first, pairedLyric.second.first) }.getOrDefault(false)) lyricsPaired++
+                            }
+                        } catch (ex: Exception) {
+                            releaseAccess(uri)
+                            failed.add(ImportFail(name, ex.message ?: "Could not import", uri.toString()))
+                            Diag.log("import-failed", "$name: ${ex.message}")
+                        }
+                        continue
+                    }
+                    if (granted) releaseAccess(uri) // the file could not be read this way: copy it instead
+
                     var tmp: File? = null
                     try {
                         val id = uid()
@@ -277,12 +400,11 @@ object Importer {
                         if (dst.length() == 0L) throw IllegalStateException("The file is empty")
                         val fp = fingerprint(dst)
                         val dup = S.tracks.value.firstOrNull { it.fp == fp }
-                        val pairedLyric = lyricFiles.firstOrNull { base(it.second.first) == base(name) }
                         if (dup != null) {
                             dst.delete()
                             skipped++
                             if (firstId == null) firstId = dup.id
-                            if (pairedLyric != null && attachLyric(dup.id, pairedLyric.first, pairedLyric.second.first)) lyricsPaired++
+                            if (pairedLyric != null && runCatching { attachLyric(dup.id, pairedLyric.first, pairedLyric.second.first) }.getOrDefault(false)) lyricsPaired++
                             continue
                         }
                         val meta = readMeta(dst, null, name)
@@ -299,9 +421,10 @@ object Importer {
                             addedAt = System.currentTimeMillis(), fp = fp, storage = "copy",
                         )
                         addTracks(listOf(t))
+                        tmp = null // the library now refers to this file: never delete it on a later error
                         added++
                         if (firstId == null) firstId = id
-                        if (pairedLyric != null && attachLyric(id, pairedLyric.first, pairedLyric.second.first)) lyricsPaired++
+                        if (pairedLyric != null && runCatching { attachLyric(id, pairedLyric.first, pairedLyric.second.first) }.getOrDefault(false)) lyricsPaired++
                     } catch (ex: Exception) {
                         tmp?.delete()
                         failed.add(ImportFail(name, ex.message ?: "Could not import", uri.toString()))
@@ -313,9 +436,11 @@ object Importer {
                     val hit = S.tracks.value.firstOrNull { base(it.fileName) == base(ns.first) && it.sidecar == null } ?: continue
                     if (attachLyric(hit.id, uri, ns.first)) lyricsPaired++
                 }
+                pruneAccess()
             }
             val notSupported = failed.count { it.uri == null && it.reason.endsWith("isn't supported yet") }
             val parts = arrayListOf("Added ${plural(added, "song")}")
+            if (kept > 0) parts.add("$kept kept where they are")
             if (skipped > 0) parts.add("$skipped already in your library")
             if (lyricsPaired > 0) parts.add("${plural(lyricsPaired, "lyric file")} paired")
             if (failed.size - notSupported > 0) parts.add("${failed.size - notSupported} failed")
@@ -490,9 +615,10 @@ object Importer {
         }
     }
 
-    /** (tracks, bytes of copied songs, free bytes) for Settings > Library. */
+    /** (tracks, bytes of songs copied into Sonora, free bytes) for Settings > Library. Songs played from their own folder take no space here. */
     fun stats(): Triple<Int, Long, Long> {
         val t = S.tracks.value
-        return Triple(t.size, t.filter { it.storage != "tree" }.sumOf { it.size }, S.app.filesDir.usableSpace)
+        val own = S.dir.absolutePath
+        return Triple(t.size, t.filter { it.uri.startsWith(own) }.sumOf { it.size }, S.app.filesDir.usableSpace)
     }
 }

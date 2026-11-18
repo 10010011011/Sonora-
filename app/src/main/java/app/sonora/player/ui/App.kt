@@ -68,6 +68,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.sonora.player.Engine
 import app.sonora.player.Importer
+import app.sonora.player.PersistableOpenMultipleDocuments
 import app.sonora.player.S
 import app.sonora.player.Track
 import kotlin.math.abs
@@ -106,7 +107,7 @@ private fun openAppSettings(ctx: Context) = runCatching {
 fun App() {
     val ctx = LocalContext.current
     val pending = remember { arrayOfNulls<Any>(2) } // [0] text waiting to be saved, [1] callback waiting for a picked text file
-    val files = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris -> Importer.importUris(uris) }
+    val files = rememberLauncherForActivityResult(PersistableOpenMultipleDocuments()) { uris -> Importer.importUris(uris) }
     val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri -> if (uri != null) Importer.addFolder(uri) }
     val saver = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
         val text = pending[0] as? String
