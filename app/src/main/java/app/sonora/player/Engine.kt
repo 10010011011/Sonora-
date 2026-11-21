@@ -28,6 +28,8 @@ import androidx.media3.exoplayer.audio.AudioRendererEventListener
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.extractor.DefaultExtractorsFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -103,6 +105,9 @@ object Engine {
 
     /** Installed by the PlaybackService; called (on the main thread) whenever the main player changes. */
     var sessionSetter: ((Player) -> Unit)? = null
+
+    /** Installed by the PlaybackService: called for every player the engine creates, including the standby one made later. */
+    var onPlayerCreated: ((ExoPlayer) -> Unit)? = null
 
     fun isPlayingAny(): Boolean = playerA?.isPlaying == true || playerB?.isPlaying == true
 
@@ -180,11 +185,16 @@ object Engine {
             // Focus is managed once for the app (see below): two players must not steal it from each other.
             .setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build(), false)
             .setWakeMode(C.WAKE_MODE_LOCAL)
+            // Raw ADTS .aac, .amr and header-less MP3 have no seek table; without this ExoPlayer treats them as unseekable.
+            .setMediaSourceFactory(DefaultMediaSourceFactory(ctx, DefaultExtractorsFactory().setConstantBitrateSeekingEnabled(true)))
             .setSeekBackIncrementMs(step)
             .setSeekForwardIncrementMs(step)
             .build()
         p.setSeekParameters(SeekParameters.EXACT)
         p.addListener(makeListener(p))
+        // The new player is not stored in playerA/playerB yet, so apply() below cannot reach it: configure it here.
+        p.setHandleAudioBecomingNoisy(st().pauseOnDisconnect)
+        onPlayerCreated?.invoke(p)
         noisyOn = null
         apply()
         return p
@@ -325,22 +335,32 @@ object Engine {
         val cur = q().qpos.coerceIn(ids.indices)
         val curId = ids[cur]
         // Gapless off (or stopping after this song): hold only the current song so it ends cleanly.
-        val want = if (st().gapless && !sleepStopsAfterCurrent()) ids else listOf(curId)
+        // Songs that left the library cannot play, so they never enter the player's playlist (and never shift its indices).
+        val want = (if (st().gapless && !sleepStopsAfterCurrent()) ids else listOf(curId)).filter { S.track(it) != null }
         if (want == playlistIds && m.mediaItemCount == want.size && m.currentMediaItem?.mediaId == curId) {
             syncRepeatMode()
             return
         }
-        if (m.mediaItemCount > 0 && m.currentMediaItem?.mediaId == curId && playlistIds.isNotEmpty()) {
+        val wantCur = want.indexOf(curId)
+        if (wantCur >= 0 && m.mediaItemCount > 0 && m.currentMediaItem?.mediaId == curId) {
+            // The song that is playing is never touched (no re-prepare, so no gap or click): the songs around it are
+            // brought in line with the queue. This also covers the hand-off after a crossfade, where the new main
+            // player holds only the song it is playing.
             val haveIdx = m.currentMediaItemIndex
+            val haveHead = List(haveIdx) { m.getMediaItemAt(it).mediaId }
+            val wantHead = want.subList(0, wantCur)
             val haveTail = m.mediaItemCount - haveIdx - 1
             if (haveTail > 0) m.removeMediaItems(haveIdx + 1, m.mediaItemCount)
-            val prefixOk = playlistIds.take(playlistIds.indexOf(curId) + 1) == want.take(want.indexOf(curId) + 1)
-            if (prefixOk) {
-                want.drop(want.indexOf(curId) + 1).forEach { id -> S.track(id)?.let { m.addMediaItem(item(it)) } }
-                playlistIds = want
-                syncRepeatMode()
-                return
+            if (haveHead != wantHead) {
+                if (haveIdx > 0) m.removeMediaItems(0, haveIdx)
+                val head = wantHead.mapNotNull { id -> S.track(id)?.let { item(it) } }
+                if (head.isNotEmpty()) m.addMediaItems(0, head)
             }
+            val tail = want.subList(wantCur + 1, want.size).mapNotNull { id -> S.track(id)?.let { item(it) } }
+            if (tail.isNotEmpty()) m.addMediaItems(tail)
+            playlistIds = want
+            syncRepeatMode()
+            return
         }
         val items = want.mapNotNull { id -> S.track(id)?.let { item(it) } }
         if (items.isEmpty()) {
@@ -348,7 +368,7 @@ object Engine {
             playlistIds = emptyList()
             return
         }
-        val startIndex = max(0, want.indexOf(curId))
+        val startIndex = max(0, wantCur)
         val posMs = startMs ?: if (m.mediaItemCount > 0 && m.currentMediaItem?.mediaId == curId) m.currentPosition else 0L
         m.setMediaItems(items, startIndex, posMs)
         m.prepare()
@@ -393,10 +413,13 @@ object Engine {
         apply()
     }
 
+    /** Only copied-in songs live at a plain file path. Kept-in-place ("ref") and folder ("tree") songs have content:// addresses that File() cannot stat. */
+    private fun onDisk(t: Track) = t.storage != "tree" && t.storage != "ref" && !t.uri.startsWith("content:") && !t.uri.startsWith("file:")
+
     /** A missing file or an unsupported format fails before the player is even involved. */
     private fun preflight(t: Track): PlaybackFailure? {
         if (supportOf(t.fileName) is Support.Unsupported) return PlaybackFailure.UNSUPPORTED
-        if (t.storage != "tree" && !File(t.uri).isFile) return PlaybackFailure.MISSING
+        if (onDisk(t) && !File(t.uri).isFile) return PlaybackFailure.MISSING
         return null
     }
 
@@ -616,18 +639,19 @@ object Engine {
      * Nothing ever skips silently.
      */
     private fun handleError(me: ExoPlayer, e: PlaybackException) {
+        val wasPlaying = me.playWhenReady // a failure while paused (the restored song at launch) must not start playback
         val id = me.currentMediaItem?.mediaId
         val t = S.track(id)
         Diag.log("player-error", "${e.errorCodeName} (${e.errorCode}) ${t?.fileName}")
         var kind = classifyFailure(e.errorCode)
         if (t != null) {
             if (supportOf(t.fileName) is Support.Unsupported) kind = PlaybackFailure.UNSUPPORTED
-            else if (t.storage != "tree" && !File(t.uri).isFile) kind = PlaybackFailure.MISSING
+            else if (onDisk(t) && !File(t.uri).isFile) kind = PlaybackFailure.MISSING
         }
         if (t != null && failureRetryable(kind) && retried.add("$id#$loadSeq")) {
             me.seekTo(me.currentMediaItemIndex, max(0L, me.currentPosition - 400))
             me.prepare()
-            me.play()
+            if (wasPlaying) me.play()
             return
         }
         failures++
@@ -640,7 +664,7 @@ object Engine {
             return
         }
         val np = nextPos(q().qpos, true)
-        if (np >= 0 && np != q().qpos) playAt(np, auto = true) else me.pause()
+        if (np >= 0 && np != q().qpos) playAt(np, auto = true, play = wasPlaying) else me.pause()
     }
 
     /** The incoming player failed mid-overlap: drop it and let the outgoing song finish. No toast here — the main player reaches the failing file next and says exactly what's wrong. */
@@ -943,7 +967,10 @@ object Engine {
                 if (isPlayingAny()) {
                     pause()
                     S.toast("Another app is using audio — paused")
-                } else applyVolumes()
+                } else {
+                    focusGranted = false // lost while idle: the next Play must ask again
+                    applyVolumes()
+                }
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
                 duck = 0.2f
